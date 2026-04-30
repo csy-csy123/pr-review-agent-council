@@ -31,6 +31,7 @@ REPORT_NAME = "report.md"
 FINDINGS_NAME = "findings.json"
 MAX_DIFF_CHARS = 120000
 MAX_CMD_OUTPUT = 50000
+MAX_SKILL_CHARS = 12000
 
 SEVERITIES = {"P0", "P1", "P2", "P3"}
 CATEGORIES = {"security", "correctness", "performance", "testing", "maintainability"}
@@ -163,6 +164,27 @@ def is_git_repo(repo: Path) -> bool:
         return True
     except Exception:
         return False
+
+
+def load_env_file(path: Path) -> list[str]:
+    if not path.exists():
+        return []
+
+    loaded: list[str] = []
+    for raw in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        if line.startswith("export "):
+            line = line[len("export "):].strip()
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip("'\"")
+        if not key or key in os.environ:
+            continue
+        os.environ[key] = value
+        loaded.append(key)
+    return loaded
 
 
 def git_range(repo: Path, base: str, target: str) -> str:
@@ -908,15 +930,43 @@ class LLMClient:
     provider = "none"
     enabled = False
 
+    def plan_review(
+        self,
+        pr_description: str,
+        skill_context: str,
+        diff: str,
+        files: list[dict[str, Any]],
+        test_result: dict[str, Any] | None,
+    ) -> dict[str, str]:
+        return {}
+
     def review(
         self,
         reviewer_name: str,
         reviewer_role: str,
+        focus: str,
+        skill_context: str,
         diff: str,
         files: list[dict[str, Any]],
         test_result: dict[str, Any] | None,
     ) -> list[Finding]:
         return []
+
+    def critique_finding(
+        self,
+        item: CouncilFinding,
+        evidence_chain: list[dict[str, Any]],
+        skill_context: str = "",
+    ) -> dict[str, str]:
+        return {}
+
+    def resolve_finding(
+        self,
+        item: CouncilFinding,
+        evidence_chain: list[dict[str, Any]],
+        skill_context: str = "",
+    ) -> dict[str, str]:
+        return {}
 
 
 class AliyunDashScopeClient(LLMClient):
@@ -937,35 +987,21 @@ class AliyunDashScopeClient(LLMClient):
         self.timeout = timeout
         self.enabled = bool(self.api_key)
 
-    def review(
-        self,
-        reviewer_name: str,
-        reviewer_role: str,
-        diff: str,
-        files: list[dict[str, Any]],
-        test_result: dict[str, Any] | None,
-    ) -> list[Finding]:
+    def _chat_json(self, agent_name: str, system_prompt: str, user_prompt: str) -> Any:
         if not self.enabled:
             self.transcript.emit(
                 "llm.skipped",
                 provider=self.provider,
-                reviewer=reviewer_name,
+                reviewer=agent_name,
                 reason="DASHSCOPE_API_KEY is not set",
             )
-            return []
+            return None
 
-        prompt = self._prompt(reviewer_name, reviewer_role, diff, files, test_result)
         payload = {
             "model": self.model,
             "messages": [
-                {
-                    "role": "system",
-                    "content": (
-                        "You are a senior code review agent. Return only valid JSON. "
-                        "Do not include markdown fences or commentary."
-                    ),
-                },
-                {"role": "user", "content": prompt},
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
             ],
             "temperature": 0.1,
         }
@@ -982,10 +1018,10 @@ class AliyunDashScopeClient(LLMClient):
         self.transcript.emit(
             "llm.request",
             provider=self.provider,
-            reviewer=reviewer_name,
+            reviewer=agent_name,
             model=self.model,
             endpoint=endpoint,
-            prompt_chars=len(prompt),
+            prompt_chars=len(user_prompt),
         )
         try:
             with urllib.request.urlopen(request, timeout=self.timeout) as response:
@@ -994,35 +1030,219 @@ class AliyunDashScopeClient(LLMClient):
             self.transcript.emit(
                 "llm.error",
                 provider=self.provider,
-                reviewer=reviewer_name,
+                reviewer=agent_name,
                 error=str(exc),
             )
-            return []
+            return None
 
         self.transcript.emit(
             "llm.response",
             provider=self.provider,
-            reviewer=reviewer_name,
+            reviewer=agent_name,
             chars=len(raw),
         )
         try:
             data = json.loads(raw)
             content = data["choices"][0]["message"]["content"]
-            return self._parse_findings(content)
+            return self._parse_json_content(content)
         except (KeyError, IndexError, TypeError, json.JSONDecodeError) as exc:
             self.transcript.emit(
                 "llm.parse_error",
                 provider=self.provider,
-                reviewer=reviewer_name,
+                reviewer=agent_name,
                 error=str(exc),
                 raw=truncate(raw, 2000),
             )
+            return None
+
+    def plan_review(
+        self,
+        pr_description: str,
+        skill_context: str,
+        diff: str,
+        files: list[dict[str, Any]],
+        test_result: dict[str, Any] | None,
+    ) -> dict[str, str]:
+        schema = {
+            "assignments": [
+                {
+                    "reviewer": "security-reviewer",
+                    "focus": "specific review focus for this PR",
+                }
+            ]
+        }
+        prompt = "\n".join(
+            [
+                "Create a concise review plan for a multi-agent PR review council.",
+                "Allowed reviewers: security-reviewer, correctness-reviewer, test-reviewer, maintainability-reviewer.",
+                "Return JSON only in this shape:",
+                json.dumps(schema, ensure_ascii=False),
+                "Code-review skill instructions:",
+                truncate(skill_context, MAX_SKILL_CHARS),
+                "PR description:",
+                pr_description[:8000],
+                "Changed files:",
+                json.dumps(files, ensure_ascii=False),
+                "Test result:",
+                json.dumps(test_result or {}, ensure_ascii=False)[:4000],
+                "Diff:",
+                truncate(diff, 40000),
+            ]
+        )
+        payload = self._chat_json("lead-reviewer.plan", self._system_prompt("lead-reviewer.plan"), prompt)
+        if not isinstance(payload, dict):
+            return {}
+        assignments = payload.get("assignments", [])
+        if not isinstance(assignments, list):
+            return {}
+        allowed = {"security-reviewer", "correctness-reviewer", "test-reviewer", "maintainability-reviewer"}
+        plan: dict[str, str] = {}
+        for item in assignments:
+            if not isinstance(item, dict):
+                continue
+            reviewer = str(item.get("reviewer", "")).strip()
+            focus = str(item.get("focus", "")).strip()
+            if reviewer in allowed and focus:
+                plan[reviewer] = focus[:1000]
+        return plan
+
+    def review(
+        self,
+        reviewer_name: str,
+        reviewer_role: str,
+        focus: str,
+        skill_context: str,
+        diff: str,
+        files: list[dict[str, Any]],
+        test_result: dict[str, Any] | None,
+    ) -> list[Finding]:
+        prompt = self._prompt(reviewer_name, reviewer_role, focus, skill_context, diff, files, test_result)
+        payload = self._chat_json(reviewer_name, self._system_prompt(reviewer_name), prompt)
+        if payload is None:
             return []
+        return self._parse_findings_payload(payload)
+
+    def critique_finding(
+        self,
+        item: CouncilFinding,
+        evidence_chain: list[dict[str, Any]],
+        skill_context: str = "",
+    ) -> dict[str, str]:
+        schema = {
+            "decision": "challenge",
+            "reason": "specific reason",
+        }
+        prompt = "\n".join(
+            [
+                "Review this proposed finding. Do not find new issues.",
+                "Decide whether the evidence is sufficient and the severity is justified.",
+                "Use decision 'challenge' or 'no_challenge'. Return JSON only:",
+                json.dumps(schema, ensure_ascii=False),
+                "Code-review skill instructions:",
+                truncate(skill_context, MAX_SKILL_CHARS),
+                "Finding:",
+                json.dumps(item.to_dict(evidence_chain), ensure_ascii=False)[:12000],
+            ]
+        )
+        payload = self._chat_json("critic-reviewer", self._system_prompt("critic-reviewer"), prompt)
+        if not isinstance(payload, dict):
+            return {}
+        decision = str(payload.get("decision", "")).strip()
+        reason = str(payload.get("reason", "")).strip()
+        if decision not in {"challenge", "no_challenge"} or not reason:
+            return {}
+        return {"decision": decision, "reason": reason[:1200]}
+
+    def resolve_finding(
+        self,
+        item: CouncilFinding,
+        evidence_chain: list[dict[str, Any]],
+        skill_context: str = "",
+    ) -> dict[str, str]:
+        schema = {
+            "resolution": "accepted",
+            "reason": "specific reason",
+            "severity": "P2",
+        }
+        prompt = "\n".join(
+            [
+                "Make the final lead-reviewer resolution for this finding.",
+                "Use resolution accepted, rejected, or downgraded.",
+                "If downgraded, include the new severity P0/P1/P2/P3.",
+                "Prefer evidence-backed findings over volume. Return JSON only:",
+                json.dumps(schema, ensure_ascii=False),
+                "Code-review skill instructions:",
+                truncate(skill_context, MAX_SKILL_CHARS),
+                "Finding:",
+                json.dumps(item.to_dict(evidence_chain), ensure_ascii=False)[:16000],
+            ]
+        )
+        payload = self._chat_json("lead-reviewer.resolve", self._system_prompt("lead-reviewer.resolve"), prompt)
+        if not isinstance(payload, dict):
+            return {}
+        resolution = str(payload.get("resolution", "")).strip()
+        reason = str(payload.get("reason", "")).strip()
+        severity = str(payload.get("severity", item.finding.severity)).strip()
+        if resolution not in {"accepted", "rejected", "downgraded"} or not reason:
+            return {}
+        if severity not in SEVERITIES:
+            severity = item.finding.severity
+        return {"resolution": resolution, "reason": reason[:1200], "severity": severity}
+
+    def _system_prompt(self, agent_name: str) -> str:
+        base = "Return only valid JSON. Do not include markdown fences or commentary."
+        prompts = {
+            "lead-reviewer.plan": (
+                "You are the lead reviewer coordinating a multi-agent PR review council. "
+                "Plan focused assignments from PR context, changed files, tests, and diff. "
+                "Prefer precise, risk-driven review focus over broad generic instructions. "
+                + base
+            ),
+            "lead-reviewer.resolve": (
+                "You are the lead reviewer making final resolutions after specialist review and critic review. "
+                "Accept only findings supported by concrete evidence from the diff or source context. "
+                "Reject weak or unrelated findings; downgrade overstated severity. "
+                + base
+            ),
+            "security-reviewer": (
+                "You are a senior security code review agent. Focus only on exploitable security risks "
+                "introduced by this diff: secrets, auth bypass, injection, unsafe command execution, "
+                "sensitive logging, crypto, and trust-boundary mistakes. Every finding must cite concrete evidence. "
+                + base
+            ),
+            "correctness-reviewer": (
+                "You are a senior correctness reviewer. Focus on business logic regressions, edge cases, "
+                "exception handling, state bugs, idempotency, data consistency, and payment correctness. "
+                "Avoid security-only or style-only issues unless they cause correctness failures. "
+                + base
+            ),
+            "test-reviewer": (
+                "You are a senior test reviewer. Focus on missing tests for changed behavior, edge cases, "
+                "failure paths, security-sensitive paths, and whether the configured tests are meaningful. "
+                "Do not report implementation issues unless the key problem is missing test coverage. "
+                + base
+            ),
+            "maintainability-reviewer": (
+                "You are a senior maintainability reviewer. Focus on long-term code health: complexity, "
+                "coupling, confusing control flow, unsafe shared state, observability, and operational clarity. "
+                "Avoid duplicating security or correctness findings unless maintainability is the main issue. "
+                + base
+            ),
+            "critic-reviewer": (
+                "You are a skeptical review critic. Your job is not to find new issues, but to verify whether "
+                "a proposed finding is well-supported, scoped to the diff, correctly categorized, and assigned "
+                "an appropriate severity. Challenge weak evidence, vague impact, wrong severity, or non-actionable findings. "
+                + base
+            ),
+        }
+        return prompts.get(agent_name, "You are a senior code review agent. " + base)
 
     def _prompt(
         self,
         reviewer_name: str,
         reviewer_role: str,
+        focus: str,
+        skill_context: str,
         diff: str,
         files: list[dict[str, Any]],
         test_result: dict[str, Any] | None,
@@ -1045,6 +1265,10 @@ class AliyunDashScopeClient(LLMClient):
             [
                 f"Reviewer: {reviewer_name}",
                 f"Role: {reviewer_role}",
+                "Lead reviewer focus for this PR:",
+                focus or "Use the role scope and the concrete diff evidence.",
+                "Code-review skill instructions:",
+                truncate(skill_context, MAX_SKILL_CHARS),
                 "Review only this role's scope. Prefer high-confidence, actionable issues.",
                 "Use severity P0/P1/P2/P3 and category security/correctness/performance/testing/maintainability.",
                 "Return JSON exactly in this shape:",
@@ -1058,19 +1282,26 @@ class AliyunDashScopeClient(LLMClient):
             ]
         )
 
-    def _parse_findings(self, content: str) -> list[Finding]:
+    def _parse_json_content(self, content: str) -> Any:
         cleaned = content.strip()
         if cleaned.startswith("```"):
             cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
             cleaned = re.sub(r"\s*```$", "", cleaned)
         try:
-            payload = json.loads(cleaned)
+            return json.loads(cleaned)
         except json.JSONDecodeError:
             match = re.search(r"\{.*\}", cleaned, flags=re.S)
             if not match:
                 raise
-            payload = json.loads(match.group(0))
-        items = payload.get("findings", payload if isinstance(payload, list) else [])
+            return json.loads(match.group(0))
+
+    def _parse_findings_payload(self, payload: Any) -> list[Finding]:
+        if isinstance(payload, dict):
+            items = payload.get("findings", [])
+        elif isinstance(payload, list):
+            items = payload
+        else:
+            items = []
         collector = FindingCollector()
         for item in items:
             if not isinstance(item, dict):
@@ -1101,10 +1332,20 @@ class ReviewAgentMember:
         diff: str,
         files: list[dict[str, Any]],
         test_result: dict[str, Any] | None,
+        focus: str = "",
+        skill_context: str = "",
     ) -> list[Finding]:
         collector = FindingCollector()
         if self.llm_client:
-            for finding in self.llm_client.review(self.name, self.role, diff, files, test_result):
+            for finding in self.llm_client.review(
+                self.name,
+                self.role,
+                focus,
+                skill_context,
+                diff,
+                files,
+                test_result,
+            ):
                 collector.emit(finding)
         reviewers = SpecialtyReviewers(self.tools, collector, self.transcript)
         reviewers.run(self.name, diff, files, test_result)
@@ -1112,25 +1353,49 @@ class ReviewAgentMember:
 
 
 class CriticReviewer:
-    def __init__(self, bus: MessageBus, evidence: EvidenceStore, lifecycle: FindingLifecycle):
+    def __init__(
+        self,
+        bus: MessageBus,
+        evidence: EvidenceStore,
+        lifecycle: FindingLifecycle,
+        llm_client: LLMClient | None = None,
+        skill_context: str = "",
+    ):
         self.name = "critic-reviewer"
         self.bus = bus
         self.evidence = evidence
         self.lifecycle = lifecycle
+        self.llm_client = llm_client
+        self.skill_context = skill_context
         self._challenged_once = False
 
     def review(self, items: list[CouncilFinding]) -> None:
         for item in items:
             chain = self.evidence.list(item.finding_id)
-            should_challenge = False
-            reason = ""
-            if item.finding.severity in {"P0", "P1"} and not self._challenged_once:
-                should_challenge = True
-                reason = "Merge-blocking severity must be backed by concrete diff evidence and source context."
-                self._challenged_once = True
-            elif len(chain) < 2:
-                should_challenge = True
-                reason = "Finding has too little evidence for a final report."
+            decision = (
+                self.llm_client.critique_finding(item, chain, self.skill_context)
+                if self.llm_client
+                else {}
+            )
+            if decision:
+                self.evidence.add(
+                    item.finding_id,
+                    "critic_review",
+                    f"{decision['decision']}: {decision['reason']}",
+                    self.name,
+                )
+                should_challenge = decision["decision"] == "challenge"
+                reason = decision["reason"]
+            else:
+                should_challenge = False
+                reason = ""
+                if item.finding.severity in {"P0", "P1"} and not self._challenged_once:
+                    should_challenge = True
+                    reason = "Merge-blocking severity must be backed by concrete diff evidence and source context."
+                    self._challenged_once = True
+                elif len(chain) < 2:
+                    should_challenge = True
+                    reason = "Finding has too little evidence for a final report."
 
             if should_challenge:
                 self.lifecycle.challenge(item.finding_id, self.name, reason)
@@ -1160,12 +1425,14 @@ class ReviewCouncil:
         collector: FindingCollector,
         critic_pass: bool = True,
         llm_client: LLMClient | None = None,
+        skill_context: str = "",
     ):
         self.tools = tools
         self.transcript = transcript
         self.collector = collector
         self.critic_pass = critic_pass
         self.llm_client = llm_client
+        self.skill_context = skill_context
         self.bus = MessageBus(transcript)
         self.evidence = EvidenceStore(transcript)
         self.lifecycle = FindingLifecycle(transcript)
@@ -1175,15 +1442,23 @@ class ReviewCouncil:
             ReviewAgentMember("test-reviewer", "Test coverage reviewer", tools, transcript, llm_client),
             ReviewAgentMember("maintainability-reviewer", "Maintainability reviewer", tools, transcript, llm_client),
         ]
-        self.critic = CriticReviewer(self.bus, self.evidence, self.lifecycle)
+        self.critic = CriticReviewer(self.bus, self.evidence, self.lifecycle, llm_client, skill_context)
 
     def run(
         self,
         diff: str,
         files: list[dict[str, Any]],
         test_result: dict[str, Any] | None,
+        pr_description: str = "",
     ) -> dict[str, Any]:
         self.transcript.emit("council.start", members=[member.name for member in self.members])
+        review_plan = (
+            self.llm_client.plan_review(pr_description, self.skill_context, diff, files, test_result)
+            if self.llm_client
+            else {}
+        )
+        if review_plan:
+            self.transcript.emit("council.plan", assignments=review_plan)
         self.bus.send(
             "lead-reviewer",
             "all",
@@ -1192,13 +1467,14 @@ class ReviewCouncil:
         )
 
         for member in self.members:
+            focus = review_plan.get(member.name, f"Scope: {member.role}. Submit only actionable findings.")
             self.bus.send(
                 "lead-reviewer",
                 member.name,
                 "task_assignment",
-                f"Scope: {member.role}. Submit only actionable findings.",
+                focus,
             )
-            findings = member.review(diff, files, test_result)
+            findings = member.review(diff, files, test_result, focus, self.skill_context)
             print(f"[council] {member.name} proposed {len(findings)} candidate finding(s)")
             for finding in findings:
                 item = self.lifecycle.candidate(finding, member.name)
@@ -1240,7 +1516,35 @@ class ReviewCouncil:
     def _resolve_findings(self) -> None:
         for item in self.lifecycle.all():
             evidence_count = len(self.evidence.list(item.finding_id))
-            if item.status == "challenged":
+            evidence_chain = self.evidence.list(item.finding_id)
+            llm_resolution = (
+                self.llm_client.resolve_finding(item, evidence_chain, self.skill_context)
+                if self.llm_client
+                else {}
+            )
+            if llm_resolution:
+                self.evidence.add(
+                    item.finding_id,
+                    "lead_resolution",
+                    f"{llm_resolution['resolution']}: {llm_resolution['reason']}",
+                    "lead-reviewer",
+                )
+                resolution = llm_resolution["resolution"]
+                reason = llm_resolution["reason"]
+                if item.status == "challenged":
+                    defense = (
+                        f"Defense: {evidence_count} evidence item(s) include diff evidence and reviewer rationale."
+                    )
+                    self.evidence.add(item.finding_id, "reviewer_defense", defense, item.proposed_by)
+                    self.bus.send(item.proposed_by, "critic-reviewer", "defense", defense, item.finding_id)
+                if resolution == "rejected":
+                    self.lifecycle.reject(item.finding_id, reason)
+                elif resolution == "downgraded":
+                    self.lifecycle.downgrade(item.finding_id, llm_resolution["severity"], reason)
+                else:
+                    self.lifecycle.accept(item.finding_id, reason)
+                self.bus.send("lead-reviewer", item.proposed_by, "resolution", reason, item.finding_id)
+            elif item.status == "challenged":
                 defense = (
                     f"Defense: {evidence_count} evidence item(s) include diff evidence and reviewer rationale."
                 )
@@ -1638,7 +1942,11 @@ class ReviewAgent:
         self.collector = FindingCollector()
         self.todos = TodoManager()
         self.skills = SkillLoader(REPO_ROOT / "skills")
+        self.skill_context = ""
         self.tools = ReviewTools(self.repo, self.base, self.target, self.transcript)
+        self.loaded_env_keys = load_env_file(self.repo / ".env")
+        if self.loaded_env_keys:
+            self.transcript.emit("env.load", path=".env", keys=self.loaded_env_keys)
         self.llm_client = self._build_llm_client()
         self.reviewers = SpecialtyReviewers(self.tools, self.collector, self.transcript)
         self.council_result: dict[str, Any] = {"findings": [], "messages": []}
@@ -1710,6 +2018,7 @@ class ReviewAgent:
         self.transcript.emit("todo.update", todos=self.todos.items)
 
         skill = self.skills.load("code-review")
+        self.skill_context = skill
         pr_description = self._description_text()
         self.transcript.emit("skill.load", name="code-review", chars=len(skill))
         if pr_description:
@@ -1740,9 +2049,10 @@ class ReviewAgent:
                 collector=self.collector,
                 critic_pass=self.critic_pass,
                 llm_client=self.llm_client,
+                skill_context=self.skill_context,
             )
             print("[agent] convening review council")
-            self.council_result = council.run(diff, files, test_result)
+            self.council_result = council.run(diff, files, test_result, pr_description)
             print(
                 f"[agent] council accepted {len(self.collector.findings)} finding(s) "
                 f"from {len(self.council_result['findings'])} candidate(s)"

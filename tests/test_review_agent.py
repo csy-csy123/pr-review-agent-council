@@ -191,7 +191,7 @@ def test_aliyun_client_without_api_key_skips_network() -> None:
         transcript=transcript,
     )
 
-    findings = client.review("security-reviewer", "Security risk reviewer", "", [], None)
+    findings = client.review("security-reviewer", "Security risk reviewer", "", "", "", [], None)
 
     assert findings == []
     events = [json.loads(line)["event"] for line in (tmp_path / "transcript.jsonl").read_text().splitlines()]
@@ -201,7 +201,7 @@ def test_aliyun_client_without_api_key_skips_network() -> None:
 class FakeLLMClient(review_agent.LLMClient):
     enabled = True
 
-    def review(self, reviewer_name, reviewer_role, diff, files, test_result):
+    def review(self, reviewer_name, reviewer_role, focus, skill_context, diff, files, test_result):
         return [
             review_agent.Finding(
                 file="service.py",
@@ -232,6 +232,63 @@ def test_review_agent_member_merges_llm_findings() -> None:
 
     assert any(finding.title == "LLM detected branch regression" for finding in findings)
 
+
+class FakeCouncilLLMClient(review_agent.LLMClient):
+    enabled = True
+    skill_seen = False
+
+    def plan_review(self, pr_description, skill_context, diff, files, test_result):
+        self.skill_seen = "code-review" in skill_context
+        return {"security-reviewer": "Focus on authentication and secrets."}
+
+    def review(self, reviewer_name, reviewer_role, focus, skill_context, diff, files, test_result):
+        if reviewer_name != "security-reviewer":
+            return []
+        return [
+            review_agent.Finding(
+                file="service.py",
+                line=2,
+                severity="P1",
+                category="security",
+                title="LLM detected auth bypass",
+                evidence="+return {'decision': 'approved'}",
+                impact="The changed branch can approve unauthorized requests.",
+                suggestion="Require signature validation before approving the request.",
+            )
+        ]
+
+    def critique_finding(self, item, evidence_chain, skill_context=""):
+        return {"decision": "challenge", "reason": "Need source context proving this is on the approval path."}
+
+    def resolve_finding(self, item, evidence_chain, skill_context=""):
+        return {"resolution": "downgraded", "reason": "Evidence supports the issue, but P2 is more appropriate.", "severity": "P2"}
+
+
+def test_review_council_uses_llm_lead_critic_and_resolution() -> None:
+    tmp_path = workspace_tmp("council-llm")
+    service = tmp_path / "service.py"
+    service.write_text("def approve():\n    return {'decision': 'approved'}\n", encoding="utf-8")
+    transcript = review_agent.Transcript(tmp_path / "transcript.jsonl")
+    tools = review_agent.ReviewTools(tmp_path, "main", "HEAD", transcript)
+    collector = review_agent.FindingCollector()
+    council = review_agent.ReviewCouncil(
+        tools,
+        transcript,
+        collector,
+        critic_pass=True,
+        llm_client=FakeCouncilLLMClient(),
+        skill_context="<skill name=\"code-review\">review rules</skill>",
+    )
+
+    result = council.run("", [{"file": "service.py", "added": 2, "deleted": 0}], None, "Auth change")
+
+    llm_record = next(item for item in result["findings"] if item["title"] == "LLM detected auth bypass")
+    assert any(finding.title == "LLM detected auth bypass" and finding.severity == "P2" for finding in collector.findings)
+    assert llm_record["resolution"] == "downgraded"
+    evidence_sources = [item["source"] for item in llm_record["evidence_chain"]]
+    assert "critic_review" in evidence_sources
+    assert "lead_resolution" in evidence_sources
+
 def test_review_council_demo_contains_challenged_accepted_finding() -> None:
     demo_commit = review_agent.run_git(
         ROOT,
@@ -245,6 +302,7 @@ def test_review_council_demo_contains_challenged_accepted_finding() -> None:
         language="en",
         mode="council",
         critic_pass=True,
+        llm_provider="none",
     )
 
     result = agent.run()
