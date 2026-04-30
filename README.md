@@ -1,132 +1,164 @@
 # PR Review Agent Council
 
-一个基于 **Aliyun DashScope / Qwen** 的 LLM-first 多 Agent PR 代码审查系统。项目参考并改造了 `learn-claude-code` 的 Agent 工程范式，将 Tool Calling、Skill Loading、Todo Tracking、JSONL Transcript、结构化输出和多 Agent 协作机制应用到 PR Review 场景。
+PR Review Agent Council 是一个基于 **Aliyun DashScope / Qwen** 的 LLM-first 多 Agent PR 代码审查系统。项目基于 `learn-claude-code` 的 Agent 工程练习范式扩展而来，将 Tool Calling、Skill Loading、Todo Tracking、MessageBus、EvidenceStore、FindingLifecycle、Structured Output 和 JSONL Trace 应用于 PR Review 场景。
 
-它不是简单的“把代码丢给大模型问有没有 bug”，而是模拟一个代码审查委员会：
+系统输入 Git diff、PR 描述和可选测试命令，自动组织多个 LLM Agent 完成审查计划、专项审查、证据绑定、反向质疑、最终裁决和报告生成。
 
-```text
-Lead Reviewer 规划任务
-    -> Security / Correctness / Test / Maintainability Reviewers 分工审查
-    -> 本地规则兜底
-    -> EvidenceStore 绑定证据链
-    -> Critic Reviewer 质疑 finding
-    -> Lead Reviewer 最终裁决
-    -> 输出 Markdown / JSON / JSONL
+## Highlights
+
+- **LLM-first Multi-Agent Review**：Lead、Security、Correctness、Test、Maintainability、Critic 多角色协作。
+- **Qwen / DashScope Integration**：通过 OpenAI-compatible Chat Completions API 调用 `qwen-turbo-latest`。
+- **Claude Code-style Agent Patterns**：参考 `learn-claude-code` 中的工具化、技能加载、任务追踪和 transcript 思路。
+- **Tool Calling**：将 Git diff、变更文件、源码上下文、测试执行和 secret scan 封装为受控工具。
+- **Skill Loading**：将 `skills/code-review/SKILL.md` 作为共享审查规范注入 Lead、Specialist、Critic 和 Lead Resolution 全链路 prompt。
+- **Agent Communication**：通过 MessageBus 记录任务分配、候选问题、质疑、答辩和裁决。
+- **Evidence-based Findings**：通过 EvidenceStore 为每个 finding 绑定 diff line、file context、critic review 和 lead resolution。
+- **Finding Lifecycle**：管理 `candidate -> challenged -> accepted / rejected / downgraded` 状态流转。
+- **Structured Output**：要求 LLM 返回 JSON，并通过 schema validation 过滤无效输出。
+- **Observability**：通过 JSONL transcript 记录工具调用、LLM 调用、Agent 消息和状态变化。
+
+## Architecture
+
+```mermaid
+flowchart TD
+    A["PR Inputs<br/>repo + base/target + PR description"] --> B["ReviewAgent<br/>orchestrator"]
+    B --> C["SkillLoader<br/>load code-review skill"]
+    B --> D["ReviewTools<br/>git diff / changed files / context / tests"]
+    B --> E["AliyunDashScopeClient<br/>Qwen chat completions"]
+
+    C --> F["skill_context<br/>shared review policy"]
+    D --> G["Lead Reviewer<br/>LLM review plan"]
+    E --> G
+    F --> G
+
+    G --> H["Security Reviewer<br/>LLM + local guardrails"]
+    G --> I["Correctness Reviewer<br/>LLM + local guardrails"]
+    G --> J["Test Reviewer<br/>LLM + local guardrails"]
+    G --> K["Maintainability Reviewer<br/>LLM + local guardrails"]
+
+    H --> L["Candidate Findings"]
+    I --> L
+    J --> L
+    K --> L
+
+    L --> M["EvidenceStore<br/>diff line + file context + rationale"]
+    L --> N["FindingLifecycle<br/>candidate / challenged / accepted / rejected / downgraded"]
+    M --> O["Critic Reviewer<br/>LLM challenge / no_challenge"]
+    F --> O
+    O --> P["Lead Reviewer<br/>LLM final resolution"]
+    M --> P
+    N --> P
+
+    P --> Q["ReportWriter"]
+    Q --> R["report.md"]
+    Q --> S["findings.json"]
+    Q --> T["transcript.jsonl"]
+
+    U["MessageBus<br/>task_assignment / candidate_finding / challenge / defense / resolution"] -.-> G
+    U -.-> H
+    U -.-> I
+    U -.-> J
+    U -.-> K
+    U -.-> O
+    U -.-> P
 ```
 
-## 项目来源与定位
+## Agent Workflow
 
-本项目基于 `learn-claude-code` 的编码 Agent 练习思路扩展而来，但没有直接依赖 Claude Code SDK。项目重点是复刻并工程化 Claude Code/Codex 类 Agent 系统中的关键设计：
+1. `ReviewAgent` loads `.env`, `code-review` skill, PR description, changed files and Git diff.
+2. `Lead Reviewer` calls Qwen to generate a role-specific review plan.
+3. `Security / Correctness / Test / Maintainability Reviewers` call Qwen with role-specific system prompts, lead focus, skill context and diff evidence.
+4. Local deterministic guardrails run after LLM review to catch high-confidence patterns such as hardcoded secrets, SQL interpolation, `shell=True`, mutable defaults and swallowed exceptions.
+5. `EvidenceStore` binds reviewer explanation, diff line and source context to each candidate finding.
+6. `Critic Reviewer` calls Qwen to challenge weak, overstated or unsupported findings.
+7. `Lead Reviewer` calls Qwen again to resolve each finding as `accepted`, `rejected` or `downgraded`.
+8. `ReportWriter` writes Markdown, JSON and JSONL outputs.
 
-- Tool Calling：将 Git diff、文件上下文、测试执行、secret scan 封装为受控工具。
-- Skill Loading：通过 `skills/code-review/SKILL.md` 加载代码审查规范，并注入全链路 LLM prompt。
-- Todo Tracking：记录审查阶段状态。
-- Multi-Agent System：Lead、Specialist、Critic 多角色协作。
-- MessageBus：记录 Agent 之间的任务、候选问题、质疑、答辩和裁决。
-- EvidenceStore：为每个 finding 绑定 diff 行、源码上下文、critic review 和 lead resolution。
-- FindingLifecycle：管理 `candidate -> challenged -> accepted/rejected/downgraded`。
-- JSONL Transcript：记录工具调用、LLM 调用、Agent 消息和状态流转。
-- Structured Output：要求 Qwen 返回 JSON，并进行 schema validation。
-
-底层 LLM 使用阿里云 DashScope 的 OpenAI-compatible Chat Completions API，默认模型为 `qwen-turbo-latest`。
-
-## 核心能力
-
-- LLM Lead Reviewer：调用 Qwen 生成 review plan，并在最后做 accepted/rejected/downgraded 裁决。
-- LLM Specialist Reviewers：Security、Correctness、Test、Maintainability 四个 reviewer 分角色审查 Git diff。
-- LLM Critic Reviewer：对每个 candidate finding 做反向审查，判断证据是否充分、严重等级是否合理、是否和本次 diff 相关。
-- 本地规则兜底：稳定识别硬编码密钥、SQL 拼接、`shell=True`、可变默认参数、吞异常、缺测试等高确定性问题。
-- Evidence-based Review：每个 finding 都绑定证据链，而不是只有自然语言结论。
-- CI-friendly Output：生成 `report.md`、`findings.json` 和 `transcript.jsonl`。
-
-## 项目结构
+## Repository Layout
 
 ```text
-agents/review_agent.py              # 核心实现：LLM client、工具、Agent Council、报告生成
-skills/code-review/SKILL.md         # 代码审查 skill：checklist、severity/category、finding schema
-demo/pr-fixture/payment_risk.py     # 支付风控 demo PR，包含多类风险场景
-docs/demo-pr.md                     # demo PR 描述
-docs/中文教程-Agent简历面试.md      # 中文教程、简历写法和面试问答
-tests/test_review_agent.py          # 单元测试和 council 集成测试
+agents/review_agent.py              # Core implementation: tools, LLM client, agent council, reports
+skills/code-review/SKILL.md         # Shared review skill: checklist, severity/category, finding schema
+demo/pr-fixture/payment_risk.py     # Payment-risk demo PR with realistic review issues
+docs/demo-pr.md                     # Demo PR description
+docs/中文教程-Agent简历面试.md      # Chinese tutorial, resume wording, interview Q&A
+tests/test_review_agent.py          # Unit and integration tests
 ```
 
-## 快速开始
+## Quick Start
 
-### 1. 安装依赖
-
-本项目主要依赖 Python 标准库，测试依赖 pytest。
+### 1. Run Tests
 
 ```powershell
 cd D:\pr-review-agent-council
 D:\envs\mind\python.exe -m pytest -p no:cacheprovider
 ```
 
-### 2. 配置 DashScope API Key
+### 2. Configure DashScope
 
-在项目根目录创建 `.env`：
+Create a `.env` file in the repository root:
 
 ```text
 DASHSCOPE_API_KEY=your_dashscope_api_key
 ```
 
-`.env` 已加入 `.gitignore`，不要提交到 GitHub。
+The application loads this file automatically before building the LLM client.
 
-### 3. 运行完整 LLM Agent Council
+### 3. Run the Review Agent
+
+Run the full Qwen-powered council:
 
 ```powershell
-cd D:\pr-review-agent-council
 D:\envs\mind\python.exe agents\review_agent.py --repo . --base HEAD~1 --target HEAD --pr-description docs\demo-pr.md --language zh --llm-provider aliyun
 ```
 
-如果只想跑本地规则、不调用 Qwen：
+Run local deterministic review only:
 
 ```powershell
 D:\envs\mind\python.exe agents\review_agent.py --repo . --base HEAD~1 --target HEAD --pr-description docs\demo-pr.md --language zh --llm-provider none
 ```
 
-## CLI 参数
+## CLI Options
 
 ```text
---repo              要审查的本地仓库路径
---base              基线提交或分支，例如 HEAD~1 / main
---target            目标提交或分支，例如 HEAD / feature-branch
---pr-description    PR 描述 Markdown 文件
---test-command      可选测试命令，例如 "python -m pytest"
---language          报告语言：zh / en
---mode              council / simple，默认 council
---critic-pass       是否启用 critic 流程：true / false
---llm-provider      aliyun / none，默认 aliyun
---llm-model         DashScope 模型名，默认 qwen-turbo-latest
---llm-base-url      DashScope OpenAI-compatible base URL
+--repo              Local repository path to review
+--base              Base revision or branch, for example HEAD~1 or main
+--target            Target revision or branch, for example HEAD or feature branch
+--pr-description    Optional PR description markdown file
+--test-command      Optional test command, for example "python -m pytest"
+--language          Report language: zh or en
+--mode              Execution mode: council or simple
+--critic-pass       Enable critic review: true or false
+--llm-provider      LLM provider: aliyun or none
+--llm-model         DashScope model name, default qwen-turbo-latest
+--llm-base-url      OpenAI-compatible DashScope base URL
 ```
 
-## 输出文件
-
-运行后会生成：
+## Outputs
 
 ```text
-.review-agent/report.md        # 给人看的 Markdown 审查报告
-.review-agent/findings.json    # 给 CI 或平台消费的结构化结果
-.review-agent/transcript.jsonl # Agent trace：工具调用、LLM 调用、消息、证据和状态流转
+.review-agent/report.md        # Human-readable review report
+.review-agent/findings.json    # Structured findings for CI or platform integration
+.review-agent/transcript.jsonl # Agent trace: tools, LLM calls, messages, evidence and lifecycle events
 ```
 
-`findings.json` 中的 verdict 可用于 CI 门禁：
+The verdict is derived from accepted findings:
 
 ```text
-approve          无需阻塞
-comment          有 P2/P3 问题
-request_changes  有 P0/P1 问题，建议阻塞合并
+approve          No actionable findings
+comment          Only P2/P3 findings
+request_changes  At least one P0/P1 finding
 ```
 
-## 如何确认真的调用了 Qwen
+## Verifying LLM Calls
 
-查看 transcript：
+Inspect the transcript:
 
 ```powershell
 Select-String -Path .review-agent\transcript.jsonl -Pattern "llm.request","llm.response","llm.error","llm.skipped"
 ```
 
-完整 LLM Agent Council 应该能看到：
+A complete LLM council run should include:
 
 ```text
 lead-reviewer.plan
@@ -138,56 +170,37 @@ critic-reviewer
 lead-reviewer.resolve
 ```
 
-如果看到 `llm.skipped`，说明没有读取到 `DASHSCOPE_API_KEY`。如果看到 `llm.error`，说明网络或 API 调用失败。
+## Demo Scenario
 
-## Demo 场景
+`demo/pr-fixture/payment_risk.py` simulates a payment-risk PR. It intentionally includes issues that require both deterministic checks and semantic review:
 
-`demo/pr-fixture/payment_risk.py` 模拟一个支付风控 PR，包含：
+- Hardcoded API token and webhook secret.
+- SQL query interpolation.
+- Unsafe shell execution.
+- Trusted merchant bypass.
+- Weak high-risk-country handling.
+- Webhook signature mismatch that still accepts events.
+- In-memory idempotency state.
+- Refund handling without original transaction validation.
+- Sensitive logging.
+- Mutable default arguments and swallowed exceptions.
+- Missing tests for production behavior changes.
 
-- 硬编码 token / webhook secret。
-- SQL f-string 拼接。
-- `shell=True` 命令执行面。
-- 商户白名单绕过风控。
-- 高风险国家小额支付直接放行。
-- webhook 签名失败仍继续接受事件。
-- 进程内列表实现幂等，重启或多实例失效。
-- `float` 处理金额精度风险。
-- 敏感信息日志泄露。
-- 可变默认参数和吞异常。
+## Relationship to learn-claude-code
 
-这些问题中，一部分适合规则兜底识别，另一部分需要 Qwen 做业务语义判断。
+This project is inspired by `learn-claude-code` rather than a direct dependency on Claude Code. It applies similar Agent engineering patterns to a Qwen-based local PR review system:
 
-## Agent 工作流
+- Tool registry and tool handlers.
+- Skill-based domain instruction loading.
+- Todo-style task state tracking.
+- Transcript-first observability.
+- Structured findings and schema validation.
+- Multi-agent delegation and review council workflow.
 
-```text
-ReviewAgent
-  ├─ load .env
-  ├─ load code-review skill
-  ├─ ReviewTools: changed_files / git_diff / file_context / tests
-  ├─ Lead Reviewer: Qwen plan_review()
-  ├─ Specialist Reviewers: Qwen review() + local rules
-  ├─ EvidenceStore: bind reviewer explanation / diff line / file context
-  ├─ Critic Reviewer: Qwen critique_finding()
-  ├─ Lead Reviewer: Qwen resolve_finding()
-  └─ ReportWriter: report.md / findings.json / transcript.jsonl
-```
-
-## GitHub 上传注意事项
-
-可以上传 GitHub，但请务必确认：
-
-- 不要提交 `.env`，里面有真实 API Key。
-- 不要提交 `.review-agent/`，里面可能包含 LLM 输出和审查上下文。
-- 不要提交 `.tmp/`、`__pycache__/`、`.pytest_cache/`。
-- 如使用 JetBrains/PyCharm，建议不要提交 `.idea/`。
-- 如果曾经误提交过 API Key，需要立刻在 DashScope 控制台吊销并重新生成。
-
-当前 `.gitignore` 已包含这些路径。
-
-## 技术关键词
+## Technology Keywords
 
 Python, Aliyun DashScope, Qwen, OpenAI-compatible Chat Completions, LLM Agent, Multi-Agent System, Tool Calling, Skill Loading, Todo Tracking, MessageBus, Agent Communication, EvidenceStore, FindingLifecycle, Critic Agent, Lead Agent Planning, Structured Output, JSON Schema Validation, JSONL Trace, Git Diff Analysis, pytest
 
-## 简历一句话
+## Resume Summary
 
-参考 Claude Code/Codex Agent 工程范式，基于 Python + Aliyun DashScope/Qwen 实现 LLM-first Multi-Agent PR Review Council，通过 Tool Calling、Skill Loading、MessageBus、EvidenceStore、FindingLifecycle、Critic Agent 和 JSONL Trace 完成可解释、可审计、可接入 CI 的 PR 风险审查。
+Built an LLM-first Multi-Agent PR Review Council based on Python and Aliyun DashScope/Qwen, inspired by learn-claude-code Agent engineering patterns. Implemented Tool Calling, Skill Loading, MessageBus, EvidenceStore, FindingLifecycle, Critic Agent and JSONL Trace to produce explainable, auditable and CI-friendly PR risk reviews.
