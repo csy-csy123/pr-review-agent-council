@@ -186,7 +186,7 @@ def test_aliyun_client_without_api_key_skips_network() -> None:
     transcript = review_agent.Transcript(tmp_path / "transcript.jsonl")
     client = review_agent.AliyunDashScopeClient(
         api_key="",
-        model="qwen-plus",
+        model="qwen-turbo-latest",
         base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
         transcript=transcript,
     )
@@ -233,10 +233,14 @@ def test_review_agent_member_merges_llm_findings() -> None:
     assert any(finding.title == "LLM detected branch regression" for finding in findings)
 
 def test_review_council_demo_contains_challenged_accepted_finding() -> None:
+    demo_commit = review_agent.run_git(
+        ROOT,
+        ["log", "--format=%H", "--grep", "Demo PR with payment risks", "--max-count=1"],
+    )
     agent = review_agent.ReviewAgent(
         repo=ROOT,
-        base="HEAD~1",
-        target="HEAD",
+        base=f"{demo_commit}^",
+        target=demo_commit,
         pr_description=ROOT / "docs" / "demo-pr.md",
         language="en",
         mode="council",

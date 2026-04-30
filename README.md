@@ -19,13 +19,14 @@
 cd D:\pr-review-agent-council
 D:\envs\mind\python.exe -m pytest
 $env:DASHSCOPE_API_KEY="??????? API Key"
-D:\envs\mind\python.exe agents\review_agent.py --repo . --base HEAD~1 --target HEAD --pr-description docs\demo-pr.md
+$demo = git log --format=%H --grep "Demo PR with payment risks" --max-count=1
+D:\envs\mind\python.exe agents\review_agent.py --repo . --base "$demo^" --target $demo --pr-description docs\demo-pr.md
 ```
 
 ?????????? OpenAI ?????
 
 - ?????`DASHSCOPE_API_KEY`
-- ?????`qwen-plus`
+- ?????`qwen-turbo-latest`
 - ?? Base URL?`https://dashscope.aliyuncs.com/compatible-mode/v1`
 - Chat endpoint?`/chat/completions`
 
@@ -42,7 +43,8 @@ D:\envs\mind\python.exe agents\review_agent.py --repo . --base HEAD~1 --target H
 ## CLI
 
 ```powershell
-D:\envs\mind\python.exe agents\review_agent.py --repo . --base HEAD~1 --target HEAD --pr-description docs\demo-pr.md
+$demo = git log --format=%H --grep "Demo PR with payment risks" --max-count=1
+D:\envs\mind\python.exe agents\review_agent.py --repo . --base "$demo^" --target $demo --pr-description docs\demo-pr.md
 ```
 
 ?????
@@ -56,7 +58,7 @@ D:\envs\mind\python.exe agents\review_agent.py --repo . --base HEAD~1 --target H
 - `--critic-pass true/false`????? Critic Reviewer ????
 - `--language zh/en`??????????
 - `--llm-provider aliyun/none`?????????? `aliyun`
-- `--llm-model qwen-plus`?????????
+- `--llm-model qwen-turbo-latest`?????????
 - `--llm-base-url`?OpenAI ??????
 
 ## ????

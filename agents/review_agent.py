@@ -147,6 +147,8 @@ def run_git(repo: Path, args: list[str], timeout: int = 60) -> str:
         cwd=repo,
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         timeout=timeout,
     )
     output = (result.stdout + result.stderr).strip()
@@ -1617,7 +1619,7 @@ class ReviewAgent:
         mode: str = "council",
         critic_pass: bool = True,
         llm_provider: str = "aliyun",
-        llm_model: str = "qwen-plus",
+        llm_model: str = "qwen-turbo-latest",
         llm_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1",
     ):
         self.repo = repo.resolve()
@@ -1789,7 +1791,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--language", choices=["zh", "en"], default="zh", help="Report language.")
     parser.add_argument("--mode", choices=["council", "simple"], default="council", help="Review execution mode.")
     parser.add_argument("--llm-provider", choices=["aliyun", "none"], default="aliyun", help="LLM provider for specialist reviewers.")
-    parser.add_argument("--llm-model", default="qwen-plus", help="Aliyun DashScope model name, e.g. qwen-plus.")
+    parser.add_argument("--llm-model", default="qwen-turbo-latest", help="Aliyun DashScope model name, e.g. qwen-turbo-latest.")
     parser.add_argument("--llm-base-url", default="https://dashscope.aliyuncs.com/compatible-mode/v1", help="OpenAI-compatible DashScope base URL.")
     parser.add_argument(
         "--critic-pass",
