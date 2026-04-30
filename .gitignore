@@ -1,0 +1,6 @@
+﻿__pycache__/
+.pytest_cache/
+.review-agent/
+.tmp/
+*.pyc
+.venv/

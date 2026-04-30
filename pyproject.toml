@@ -1,0 +1,9 @@
+[project]
+name = "pr-review-agent-council"
+version = "0.1.0"
+description = "Local multi-agent PR risk review assistant"
+requires-python = ">=3.10"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
