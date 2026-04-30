@@ -13,9 +13,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import time
+import urllib.error
+import urllib.request
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -898,12 +901,198 @@ class SpecialtyReviewers:
         return len(self.collector.findings) - before
 
 
+
+class LLMClient:
+    provider = "none"
+    enabled = False
+
+    def review(
+        self,
+        reviewer_name: str,
+        reviewer_role: str,
+        diff: str,
+        files: list[dict[str, Any]],
+        test_result: dict[str, Any] | None,
+    ) -> list[Finding]:
+        return []
+
+
+class AliyunDashScopeClient(LLMClient):
+    provider = "aliyun"
+
+    def __init__(
+        self,
+        api_key: str | None,
+        model: str,
+        base_url: str,
+        transcript: Transcript,
+        timeout: int = 60,
+    ):
+        self.api_key = api_key or ""
+        self.model = model
+        self.base_url = base_url.rstrip("/")
+        self.transcript = transcript
+        self.timeout = timeout
+        self.enabled = bool(self.api_key)
+
+    def review(
+        self,
+        reviewer_name: str,
+        reviewer_role: str,
+        diff: str,
+        files: list[dict[str, Any]],
+        test_result: dict[str, Any] | None,
+    ) -> list[Finding]:
+        if not self.enabled:
+            self.transcript.emit(
+                "llm.skipped",
+                provider=self.provider,
+                reviewer=reviewer_name,
+                reason="DASHSCOPE_API_KEY is not set",
+            )
+            return []
+
+        prompt = self._prompt(reviewer_name, reviewer_role, diff, files, test_result)
+        payload = {
+            "model": self.model,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a senior code review agent. Return only valid JSON. "
+                        "Do not include markdown fences or commentary."
+                    ),
+                },
+                {"role": "user", "content": prompt},
+            ],
+            "temperature": 0.1,
+        }
+        endpoint = f"{self.base_url}/chat/completions"
+        request = urllib.request.Request(
+            endpoint,
+            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        self.transcript.emit(
+            "llm.request",
+            provider=self.provider,
+            reviewer=reviewer_name,
+            model=self.model,
+            endpoint=endpoint,
+            prompt_chars=len(prompt),
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                raw = response.read().decode("utf-8", errors="replace")
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            self.transcript.emit(
+                "llm.error",
+                provider=self.provider,
+                reviewer=reviewer_name,
+                error=str(exc),
+            )
+            return []
+
+        self.transcript.emit(
+            "llm.response",
+            provider=self.provider,
+            reviewer=reviewer_name,
+            chars=len(raw),
+        )
+        try:
+            data = json.loads(raw)
+            content = data["choices"][0]["message"]["content"]
+            return self._parse_findings(content)
+        except (KeyError, IndexError, TypeError, json.JSONDecodeError) as exc:
+            self.transcript.emit(
+                "llm.parse_error",
+                provider=self.provider,
+                reviewer=reviewer_name,
+                error=str(exc),
+                raw=truncate(raw, 2000),
+            )
+            return []
+
+    def _prompt(
+        self,
+        reviewer_name: str,
+        reviewer_role: str,
+        diff: str,
+        files: list[dict[str, Any]],
+        test_result: dict[str, Any] | None,
+    ) -> str:
+        schema = {
+            "findings": [
+                {
+                    "file": "path/to/file.py",
+                    "line": 42,
+                    "severity": "P1",
+                    "category": "security",
+                    "title": "short actionable title",
+                    "evidence": "specific diff line or code snippet",
+                    "impact": "why this matters",
+                    "suggestion": "concrete fix",
+                }
+            ]
+        }
+        return "\n".join(
+            [
+                f"Reviewer: {reviewer_name}",
+                f"Role: {reviewer_role}",
+                "Review only this role's scope. Prefer high-confidence, actionable issues.",
+                "Use severity P0/P1/P2/P3 and category security/correctness/performance/testing/maintainability.",
+                "Return JSON exactly in this shape:",
+                json.dumps(schema, ensure_ascii=False),
+                "Changed files:",
+                json.dumps(files, ensure_ascii=False),
+                "Test result:",
+                json.dumps(test_result or {}, ensure_ascii=False)[:4000],
+                "Diff:",
+                truncate(diff, MAX_DIFF_CHARS),
+            ]
+        )
+
+    def _parse_findings(self, content: str) -> list[Finding]:
+        cleaned = content.strip()
+        if cleaned.startswith("```"):
+            cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
+            cleaned = re.sub(r"\s*```$", "", cleaned)
+        try:
+            payload = json.loads(cleaned)
+        except json.JSONDecodeError:
+            match = re.search(r"\{.*\}", cleaned, flags=re.S)
+            if not match:
+                raise
+            payload = json.loads(match.group(0))
+        items = payload.get("findings", payload if isinstance(payload, list) else [])
+        collector = FindingCollector()
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            try:
+                collector.emit(item)
+            except ValueError:
+                continue
+        return collector.sorted()
+
 class ReviewAgentMember:
-    def __init__(self, name: str, role: str, tools: ReviewTools, transcript: Transcript):
+    def __init__(
+        self,
+        name: str,
+        role: str,
+        tools: ReviewTools,
+        transcript: Transcript,
+        llm_client: LLMClient | None = None,
+    ):
         self.name = name
         self.role = role
         self.tools = tools
         self.transcript = transcript
+        self.llm_client = llm_client
 
     def review(
         self,
@@ -912,6 +1101,9 @@ class ReviewAgentMember:
         test_result: dict[str, Any] | None,
     ) -> list[Finding]:
         collector = FindingCollector()
+        if self.llm_client:
+            for finding in self.llm_client.review(self.name, self.role, diff, files, test_result):
+                collector.emit(finding)
         reviewers = SpecialtyReviewers(self.tools, collector, self.transcript)
         reviewers.run(self.name, diff, files, test_result)
         return collector.sorted()
@@ -965,19 +1157,21 @@ class ReviewCouncil:
         transcript: Transcript,
         collector: FindingCollector,
         critic_pass: bool = True,
+        llm_client: LLMClient | None = None,
     ):
         self.tools = tools
         self.transcript = transcript
         self.collector = collector
         self.critic_pass = critic_pass
+        self.llm_client = llm_client
         self.bus = MessageBus(transcript)
         self.evidence = EvidenceStore(transcript)
         self.lifecycle = FindingLifecycle(transcript)
         self.members = [
-            ReviewAgentMember("security-reviewer", "Security risk reviewer", tools, transcript),
-            ReviewAgentMember("correctness-reviewer", "Correctness and edge-case reviewer", tools, transcript),
-            ReviewAgentMember("test-reviewer", "Test coverage reviewer", tools, transcript),
-            ReviewAgentMember("maintainability-reviewer", "Maintainability reviewer", tools, transcript),
+            ReviewAgentMember("security-reviewer", "Security risk reviewer", tools, transcript, llm_client),
+            ReviewAgentMember("correctness-reviewer", "Correctness and edge-case reviewer", tools, transcript, llm_client),
+            ReviewAgentMember("test-reviewer", "Test coverage reviewer", tools, transcript, llm_client),
+            ReviewAgentMember("maintainability-reviewer", "Maintainability reviewer", tools, transcript, llm_client),
         ]
         self.critic = CriticReviewer(self.bus, self.evidence, self.lifecycle)
 
@@ -1422,6 +1616,9 @@ class ReviewAgent:
         language: str = "zh",
         mode: str = "council",
         critic_pass: bool = True,
+        llm_provider: str = "aliyun",
+        llm_model: str = "qwen-plus",
+        llm_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1",
     ):
         self.repo = repo.resolve()
         self.base = base
@@ -1431,12 +1628,16 @@ class ReviewAgent:
         self.language = language
         self.mode = mode
         self.critic_pass = critic_pass
+        self.llm_provider = llm_provider
+        self.llm_model = llm_model
+        self.llm_base_url = llm_base_url
         self.output_dir = self.repo / OUTPUT_DIR_NAME
         self.transcript = Transcript(self.output_dir / TRANSCRIPT_NAME)
         self.collector = FindingCollector()
         self.todos = TodoManager()
         self.skills = SkillLoader(REPO_ROOT / "skills")
         self.tools = ReviewTools(self.repo, self.base, self.target, self.transcript)
+        self.llm_client = self._build_llm_client()
         self.reviewers = SpecialtyReviewers(self.tools, self.collector, self.transcript)
         self.council_result: dict[str, Any] = {"findings": [], "messages": []}
         self.tool_handlers: dict[str, Callable[..., Any]] = {
@@ -1455,6 +1656,27 @@ class ReviewAgent:
             ).write(),
         }
 
+    def _build_llm_client(self) -> LLMClient | None:
+        if self.llm_provider == "none":
+            self.transcript.emit("llm.disabled", provider="none")
+            return None
+        if self.llm_provider == "aliyun":
+            client = AliyunDashScopeClient(
+                api_key=os.getenv("DASHSCOPE_API_KEY"),
+                model=self.llm_model,
+                base_url=self.llm_base_url,
+                transcript=self.transcript,
+            )
+            self.transcript.emit(
+                "llm.configure",
+                provider=client.provider,
+                model=client.model,
+                base_url=client.base_url,
+                enabled=client.enabled,
+            )
+            return client
+        raise ValueError(f"Unsupported LLM provider: {self.llm_provider}")
+
     def _description_text(self) -> str:
         if not self.pr_description:
             return ""
@@ -1470,6 +1692,8 @@ class ReviewAgent:
             base=self.base,
             target=self.target,
             mode=self.mode,
+            llm_provider=self.llm_provider,
+            llm_model=self.llm_model,
             tools=[tool["name"] for tool in TOOLS],
             skills=self.skills.descriptions(),
         )
@@ -1513,6 +1737,7 @@ class ReviewAgent:
                 transcript=self.transcript,
                 collector=self.collector,
                 critic_pass=self.critic_pass,
+                llm_client=self.llm_client,
             )
             print("[agent] convening review council")
             self.council_result = council.run(diff, files, test_result)
@@ -1563,6 +1788,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--test-command", help="Optional test command to run, e.g. 'python -m pytest'.")
     parser.add_argument("--language", choices=["zh", "en"], default="zh", help="Report language.")
     parser.add_argument("--mode", choices=["council", "simple"], default="council", help="Review execution mode.")
+    parser.add_argument("--llm-provider", choices=["aliyun", "none"], default="aliyun", help="LLM provider for specialist reviewers.")
+    parser.add_argument("--llm-model", default="qwen-plus", help="Aliyun DashScope model name, e.g. qwen-plus.")
+    parser.add_argument("--llm-base-url", default="https://dashscope.aliyuncs.com/compatible-mode/v1", help="OpenAI-compatible DashScope base URL.")
     parser.add_argument(
         "--critic-pass",
         choices=["true", "false"],
@@ -1585,6 +1813,9 @@ def main(argv: list[str] | None = None) -> int:
         language=args.language,
         mode=args.mode,
         critic_pass=args.critic_pass == "true",
+        llm_provider=args.llm_provider,
+        llm_model=args.llm_model,
+        llm_base_url=args.llm_base_url,
     )
     result = agent.run()
     print(f"[agent] verdict: {result['verdict']}")

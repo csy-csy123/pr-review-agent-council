@@ -180,6 +180,58 @@ def test_evidence_store_binds_items_to_finding() -> None:
     assert [item["source"] for item in chain] == ["diff_line", "critic_challenge"]
 
 
+
+def test_aliyun_client_without_api_key_skips_network() -> None:
+    tmp_path = workspace_tmp("aliyun-no-key")
+    transcript = review_agent.Transcript(tmp_path / "transcript.jsonl")
+    client = review_agent.AliyunDashScopeClient(
+        api_key="",
+        model="qwen-plus",
+        base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+        transcript=transcript,
+    )
+
+    findings = client.review("security-reviewer", "Security risk reviewer", "", [], None)
+
+    assert findings == []
+    events = [json.loads(line)["event"] for line in (tmp_path / "transcript.jsonl").read_text().splitlines()]
+    assert "llm.skipped" in events
+
+
+class FakeLLMClient(review_agent.LLMClient):
+    enabled = True
+
+    def review(self, reviewer_name, reviewer_role, diff, files, test_result):
+        return [
+            review_agent.Finding(
+                file="service.py",
+                line=2,
+                severity="P2",
+                category="correctness",
+                title="LLM detected branch regression",
+                evidence="+return False",
+                impact="The changed branch can reject valid requests.",
+                suggestion="Restore the original condition or add a targeted test.",
+            )
+        ]
+
+
+def test_review_agent_member_merges_llm_findings() -> None:
+    tmp_path = workspace_tmp("member-llm")
+    transcript = review_agent.Transcript(tmp_path / "transcript.jsonl")
+    tools = review_agent.ReviewTools(tmp_path, "main", "HEAD", transcript)
+    member = review_agent.ReviewAgentMember(
+        "correctness-reviewer",
+        "Correctness and edge-case reviewer",
+        tools,
+        transcript,
+        FakeLLMClient(),
+    )
+
+    findings = member.review("", [], None)
+
+    assert any(finding.title == "LLM detected branch regression" for finding in findings)
+
 def test_review_council_demo_contains_challenged_accepted_finding() -> None:
     agent = review_agent.ReviewAgent(
         repo=ROOT,
