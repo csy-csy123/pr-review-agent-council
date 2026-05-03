@@ -1,5 +1,7 @@
 # PR Review Agent Council
 
+[![Star History Chart](https://api.star-history.com/svg?repos=csy-csy123/pr-review-agent-council&type=Date)](https://www.star-history.com/#csy-csy123/pr-review-agent-council&Date)
+
 面向中文用户的 **Debate Council PR Review Agent**。项目基于 `learn-claude-code` 的 Agent 工程思路改造，用 Python + Aliyun DashScope/Qwen 实现一个只读 PR Review Agent：读取 Git diff 和 PR 描述，组织多个 reviewer 生成候选问题，再通过 debate loop 对 finding 进行质疑、补证、反驳、合并和裁决，最后输出标准化报告，并可用 AI Judge 做质量评估。
 
 当前默认模式是 `--mode debate`。旧的 `--mode council` 仍然保留，作为固定 workflow baseline，方便复现、教学和效果对比。
