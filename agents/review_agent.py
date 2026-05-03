@@ -29,6 +29,10 @@ OUTPUT_DIR_NAME = ".review-agent"
 TRANSCRIPT_NAME = "transcript.jsonl"
 REPORT_NAME = "report.md"
 FINDINGS_NAME = "findings.json"
+JUDGE_INPUT_NAME = "judge_input.json"
+JUDGE_NAME = "judge.json"
+JUDGE_REPORT_NAME = "judge.md"
+JUDGE_TRANSCRIPT_NAME = "judge-transcript.jsonl"
 MAX_DIFF_CHARS = 120000
 MAX_CMD_OUTPUT = 50000
 MAX_SKILL_CHARS = 12000
@@ -87,6 +91,24 @@ TOOLS = [
     {
         "name": "secret_scan",
         "description": "Scan changed files and added diff lines for likely secrets.",
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "search_code",
+        "description": "Search text files in the repository for a query or regex.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+                "path": {"type": "string"},
+                "max_matches": {"type": "integer"},
+            },
+            "required": ["query"],
+        },
+    },
+    {
+        "name": "risk_scan",
+        "description": "Extract review-worthy risk signals from added diff lines for the LLM to judge.",
         "input_schema": {"type": "object", "properties": {}},
     },
     {
@@ -581,6 +603,19 @@ class FindingLifecycle:
         self.transcript.emit("council.finding.downgrade", finding_id=finding_id, severity=severity)
         return item
 
+    def revise(self, finding_id: str, finding: Finding, reason: str) -> CouncilFinding:
+        finding.validate()
+        item = self._items[finding_id]
+        old_key = (item.finding.file, item.finding.line, item.finding.category, item.finding.title)
+        self._keys.pop(old_key, None)
+        item.finding = finding
+        item.status = "candidate"
+        item.resolution = "revised"
+        item.resolution_reason = reason
+        self._keys[(finding.file, finding.line, finding.category, finding.title)] = finding_id
+        self.transcript.emit("council.finding.revise", finding_id=finding_id, reason=reason)
+        return item
+
     def accepted(self) -> list[CouncilFinding]:
         return [item for item in self._items.values() if item.status in {"accepted", "downgraded"}]
 
@@ -734,6 +769,151 @@ class ReviewTools:
                 )
         self.transcript.emit("tool.secret_scan", count=len(findings))
         return findings
+
+    def search_code(self, query: str, path: str | None = None, max_matches: int = 20) -> list[dict[str, Any]]:
+        if not query.strip():
+            raise ValueError("search_code query is required")
+        root = safe_repo_path(self.repo, path or ".")
+        max_matches = max(1, min(int(max_matches or 20), 100))
+        try:
+            pattern = re.compile(query)
+        except re.error:
+            pattern = re.compile(re.escape(query))
+        excluded = {".git", ".review-agent", ".tmp", ".pytest_cache", "__pycache__", "node_modules", ".venv"}
+        candidates = [root] if root.is_file() else sorted(root.rglob("*"))
+        matches: list[dict[str, Any]] = []
+        for fp in candidates:
+            if len(matches) >= max_matches:
+                break
+            if not fp.is_file():
+                continue
+            rel = fp.relative_to(self.repo)
+            if any(part in excluded for part in rel.parts):
+                continue
+            if not (is_source_file(rel.as_posix()) or rel.suffix.lower() in {".md", ".txt", ".toml", ".yaml", ".yml", ".json"}):
+                continue
+            try:
+                lines = fp.read_text(encoding="utf-8", errors="replace").splitlines()
+            except OSError:
+                continue
+            for number, text in enumerate(lines, start=1):
+                if pattern.search(text):
+                    matches.append({"file": rel.as_posix(), "line": number, "text": truncate(text.strip(), 500)})
+                    if len(matches) >= max_matches:
+                        break
+        self.transcript.emit("tool.search_code", query=query, path=path or ".", count=len(matches))
+        return matches
+
+    def risk_scan(self) -> list[dict[str, Any]]:
+        diff = self.git_diff()
+        signals: list[dict[str, Any]] = []
+        added = list(iter_added_lines(diff))
+        added_by_file: dict[str, list[dict[str, Any]]] = {}
+        for line in added:
+            added_by_file.setdefault(line["file"], []).append(line)
+
+        def add(line: dict[str, Any], category: str, signal: str, rationale: str) -> None:
+            signals.append(
+                {
+                    "file": line["file"],
+                    "line": line["line"],
+                    "category": category,
+                    "signal": signal,
+                    "evidence": truncate(line["text"].strip(), 500),
+                    "rationale": rationale,
+                }
+            )
+
+        pending_execute: dict[str, dict[str, Any]] = {}
+        pending_except: dict[str, dict[str, Any]] = {}
+        for line in added:
+            text = line["text"]
+            stripped = text.strip()
+            file_path = line["file"]
+            lowered = stripped.lower()
+            if ".execute(" in stripped:
+                pending_execute[file_path] = line
+            elif file_path in pending_execute and ('f"' in stripped or "f'" in stripped or "{" in stripped):
+                add(
+                    line,
+                    "security",
+                    "sql_interpolation",
+                    "SQL text appears to interpolate variables across a multi-line execute call.",
+                )
+                pending_execute.pop(file_path, None)
+            if re.search(r"\.execute\(f[\"']", stripped) or re.search(r"\.execute\(.*\+.*\)", stripped):
+                add(line, "security", "sql_interpolation", "SQL query appears to interpolate values directly.")
+            if "shell=True" in stripped or re.search(r"\bos\.system\(", stripped):
+                add(line, "security", "shell_execution", "Shell execution is introduced on a path containing formatted values.")
+            if re.match(r"def .*=\s*(\[\]|\{\})", stripped):
+                add(line, "correctness", "mutable_default", "Mutable default arguments can share state across requests.")
+            if re.match(r"except(?:\s+Exception)?\s*:$", stripped):
+                pending_except[file_path] = line
+            if re.match(r"except(?:\s+Exception)?\s*:\s*pass$", stripped) or (
+                stripped == "pass" and pending_except.get(file_path, {}).get("line") == line["line"] - 1
+            ):
+                add(
+                    pending_except.get(file_path, line),
+                    "correctness",
+                    "swallowed_exception",
+                    "The new code swallows exceptions and can fail open or hide data failures.",
+                )
+            if re.search(r"\b(print|logging\.\w+)\(.*(token|secret|signature|card|password)", lowered):
+                add(line, "security", "sensitive_logging", "Sensitive values appear in logs or print output.")
+            if "signature !=" in stripped and file_path in added_by_file:
+                next_lines = [
+                    item["text"].strip().lower()
+                    for item in added_by_file[file_path]
+                    if line["line"] < item["line"] <= line["line"] + 3
+                ]
+                if not any(text.startswith(("return", "raise")) for text in next_lines):
+                    add(line, "security", "signature_mismatch_not_rejected", "Signature mismatch is observed but not rejected.")
+            if "startswith(\"test-\")" in stripped or "startswith('test-')" in stripped:
+                add(line, "correctness", "trust_bypass_pattern", "A test-prefix shortcut can accidentally trust production input.")
+            if "high_risk" in lowered and "approved" in lowered:
+                add(line, "correctness", "risk_rule_approves_high_risk_case", "High-risk payment logic returns approval.")
+            if "amount = -abs(" in stripped:
+                add(line, "correctness", "negative_amount_refund", "Refund handling creates negative amounts that may need downstream validation.")
+
+        changed_files = self.changed_files()
+        if any(is_source_file(item.get("file", "")) for item in changed_files) and not any(
+            is_test_file(item.get("file", "")) for item in changed_files
+        ):
+            first_source = next(item for item in changed_files if is_source_file(item.get("file", "")))
+            signals.append(
+                {
+                    "file": first_source["file"],
+                    "line": 1,
+                    "category": "testing",
+                    "signal": "no_tests_changed",
+                    "evidence": "No test files changed with this source diff.",
+                    "rationale": "Risk-sensitive source changes should normally include targeted tests.",
+                }
+            )
+            test_signal_map = {
+                "risk_rule_approves_high_risk_case": "missing_test_high_risk_country_logic",
+                "signature_mismatch_not_rejected": "missing_test_webhook_signature_mismatch",
+                "negative_amount_refund": "missing_test_refund_amount_handling",
+                "sql_interpolation": "missing_test_sql_parameterization_or_malicious_user_id",
+                "shell_execution": "missing_test_shell_execution_input_handling",
+                "swallowed_exception": "missing_test_failure_path",
+            }
+            for signal in list(signals):
+                mapped = test_signal_map.get(signal["signal"])
+                if not mapped:
+                    continue
+                signals.append(
+                    {
+                        "file": signal["file"],
+                        "line": signal["line"],
+                        "category": "testing",
+                        "signal": mapped,
+                        "evidence": signal["evidence"],
+                        "rationale": f"No test files changed for critical behavior: {signal['rationale']}",
+                    }
+                )
+        self.transcript.emit("tool.risk_scan", count=len(signals))
+        return signals
 
 
 class SpecialtyReviewers:
@@ -968,6 +1148,58 @@ class LLMClient:
     ) -> dict[str, str]:
         return {}
 
+    def next_action(
+        self,
+        agent_state: dict[str, Any],
+        skill_context: str,
+        tools: list[dict[str, Any]],
+        observations: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        return {}
+
+    def coverage_review(
+        self,
+        pr_description: str,
+        skill_context: str,
+        diff: str,
+        files: list[dict[str, Any]],
+        existing_findings: list[dict[str, Any]],
+        observations: list[dict[str, Any]],
+    ) -> list[Finding]:
+        return []
+
+    def next_debate_action(
+        self,
+        debate_state: dict[str, Any],
+        skill_context: str,
+    ) -> dict[str, Any]:
+        return {}
+
+    def reviewer_defense(
+        self,
+        reviewer_name: str,
+        item: CouncilFinding,
+        challenge: str,
+        evidence_chain: list[dict[str, Any]],
+        skill_context: str = "",
+    ) -> dict[str, Any]:
+        return {}
+
+    def report_writer_review(
+        self,
+        report_context: dict[str, Any],
+        language: str = "zh",
+    ) -> dict[str, Any]:
+        return {}
+
+    def judge_report(
+        self,
+        judge_input: dict[str, Any],
+        diff: str,
+        pr_description: str,
+    ) -> dict[str, Any]:
+        return {}
+
 
 class AliyunDashScopeClient(LLMClient):
     provider = "aliyun"
@@ -986,8 +1218,11 @@ class AliyunDashScopeClient(LLMClient):
         self.transcript = transcript
         self.timeout = timeout
         self.enabled = bool(self.api_key)
+        self._pending_actions: list[dict[str, Any]] = []
+        self._last_extra_json_payloads: list[Any] = []
 
     def _chat_json(self, agent_name: str, system_prompt: str, user_prompt: str) -> Any:
+        self._last_extra_json_payloads = []
         if not self.enabled:
             self.transcript.emit(
                 "llm.skipped",
@@ -1189,6 +1424,375 @@ class AliyunDashScopeClient(LLMClient):
             severity = item.finding.severity
         return {"resolution": resolution, "reason": reason[:1200], "severity": severity}
 
+    def coverage_review(
+        self,
+        pr_description: str,
+        skill_context: str,
+        diff: str,
+        files: list[dict[str, Any]],
+        existing_findings: list[dict[str, Any]],
+        observations: list[dict[str, Any]],
+    ) -> list[Finding]:
+        schema = {
+            "findings": [
+                {
+                    "file": "path/to/file.py",
+                    "line": 42,
+                    "severity": "P1",
+                    "category": "security",
+                    "title": "short actionable title",
+                    "evidence": "specific diff line or code snippet",
+                    "impact": "why this matters",
+                    "suggestion": "concrete fix",
+                }
+            ]
+        }
+        prompt = "\n".join(
+            [
+                "You are the same autonomous PR review agent doing a final coverage reflection before finalize.",
+                "This is not a role-based workflow. Do one holistic pass over the full diff and current evidence.",
+                "Find high-confidence issues the dynamic loop may have missed.",
+                "The recent observations may include a risk_scan result. Treat those risk signals as candidate evidence,",
+                "and convert every high-confidence non-duplicate risk signal into a finding.",
+                "Prioritize merge-blocking or reviewer-worthy findings across:",
+                "- injection and unsafe command execution",
+                "- secrets, sensitive logging, and trust-boundary mistakes",
+                "- authentication, webhook signature, idempotency, and replay handling",
+                "- mutable default arguments or shared state across requests",
+                "- swallowed exceptions and fail-open behavior",
+                "- suspicious business logic bypasses",
+                "- missing tests for critical changed behavior",
+                "If risk_scan reports testing signals, prefer concrete missing-test findings tied to the exact changed behavior.",
+                "Avoid duplicates of existing findings. Do not invent issues outside the diff.",
+                "Do not report documented placeholders such as your_api_key in .env.example as leaked real secrets.",
+                "Return JSON only in this shape:",
+                json.dumps(schema, ensure_ascii=False),
+                "Code-review skill instructions:",
+                truncate(skill_context, MAX_SKILL_CHARS),
+                "PR description:",
+                pr_description[:8000],
+                "Changed files:",
+                json.dumps(files, ensure_ascii=False),
+                "Existing findings:",
+                json.dumps(existing_findings, ensure_ascii=False)[:12000],
+                "Recent observations:",
+                json.dumps(observations[-12:], ensure_ascii=False)[:16000],
+                "Full diff:",
+                truncate(diff, MAX_DIFF_CHARS),
+            ]
+        )
+        payload = self._chat_json(
+            "agentic-reviewer.coverage_review",
+            self._system_prompt("agentic-reviewer"),
+            prompt,
+        )
+        if payload is None:
+            return []
+        return self._parse_findings_payload(payload)
+
+    def next_debate_action(
+        self,
+        debate_state: dict[str, Any],
+        skill_context: str,
+    ) -> dict[str, Any]:
+        schema = {
+            "thought": "short reason for the next debate step",
+            "action": "ask_critic",
+            "finding_id": "F-001",
+            "reason": "why this action is useful",
+        }
+        allowed = [
+            "ask_critic",
+            "request_reviewer_defense",
+            "request_more_evidence",
+            "revise_finding",
+            "merge_duplicates",
+            "accept_finding",
+            "reject_finding",
+            "ask_report_writer",
+            "finalize",
+        ]
+        prompt = "\n".join(
+            [
+                "You are the lead controller of a multi-agent code review debate council.",
+                "Do not follow a fixed workflow. Choose the single most useful next debate action.",
+                "The goal is high-quality review, not a larger number of findings.",
+                "Prefer actions that reduce duplicates, improve evidence, correct severity, or remove noise.",
+                "Allowed actions:",
+                ", ".join(allowed),
+                "For revise_finding include finding_id, finding, and reason.",
+                "For merge_duplicates include source_id, target_id, and reason.",
+                "For accept_finding/reject_finding include finding_id and reason.",
+                "For request_more_evidence include finding_id and reason.",
+                "For ask_report_writer include reason.",
+                "Return JSON only in this shape:",
+                json.dumps(schema, ensure_ascii=False),
+                "Code-review skill instructions:",
+                truncate(skill_context, MAX_SKILL_CHARS),
+                "Current debate state:",
+                json.dumps(debate_state, ensure_ascii=False)[:40000],
+            ]
+        )
+        payload = self._chat_json("lead-reviewer.debate", self._system_prompt("lead-reviewer.debate"), prompt)
+        if not isinstance(payload, dict):
+            return {}
+        return self._normalize_debate_action(payload)
+
+    def reviewer_defense(
+        self,
+        reviewer_name: str,
+        item: CouncilFinding,
+        challenge: str,
+        evidence_chain: list[dict[str, Any]],
+        skill_context: str = "",
+    ) -> dict[str, Any]:
+        schema = {
+            "decision": "defend",
+            "reason": "why the finding should stand, be revised, or be withdrawn",
+            "finding": {
+                "file": "path/to/file.py",
+                "line": 42,
+                "severity": "P2",
+                "category": "security",
+                "title": "revised title if decision is revise",
+                "evidence": "specific evidence",
+                "impact": "impact",
+                "suggestion": "fix",
+            },
+        }
+        prompt = "\n".join(
+            [
+                f"You are {reviewer_name} responding to a critic challenge.",
+                "Choose decision defend, revise, or withdraw.",
+                "If revise, include a complete revised finding. If defend or withdraw, finding may be omitted.",
+                "Return JSON only in this shape:",
+                json.dumps(schema, ensure_ascii=False),
+                "Code-review skill instructions:",
+                truncate(skill_context, MAX_SKILL_CHARS),
+                "Challenge:",
+                challenge[:4000],
+                "Finding and evidence:",
+                json.dumps(item.to_dict(evidence_chain), ensure_ascii=False)[:16000],
+            ]
+        )
+        payload = self._chat_json(reviewer_name + ".defense", self._system_prompt(reviewer_name), prompt)
+        if not isinstance(payload, dict):
+            return {}
+        decision = str(payload.get("decision", "")).strip()
+        reason = str(payload.get("reason", "")).strip()
+        if decision not in {"defend", "revise", "withdraw"} or not reason:
+            return {}
+        result: dict[str, Any] = {"decision": decision, "reason": reason[:1200]}
+        finding = payload.get("finding")
+        if decision == "revise" and isinstance(finding, dict):
+            try:
+                Finding(**finding).validate()
+            except (TypeError, ValueError):
+                return {}
+            result["finding"] = finding
+        return result
+
+    def report_writer_review(
+        self,
+        report_context: dict[str, Any],
+        language: str = "zh",
+    ) -> dict[str, Any]:
+        schema = {
+            "verdict": "request_changes",
+            "summary_points": ["short factual point"],
+            "accepted_findings": [
+                {
+                    "issue": "short issue",
+                    "severity": "P1",
+                    "file": "path/to/file.py",
+                    "line": 42,
+                    "evidence": "specific evidence",
+                    "impact": "impact",
+                    "fix": "fix",
+                    "why_accepted": "evidence-backed reason",
+                    "critic_notes": "critic or lead notes",
+                }
+            ],
+            "rejected_findings": [],
+            "downgraded_findings": [],
+            "duplicate_notes": [],
+            "critic_notes": [],
+        }
+        prompt = "\n".join(
+            [
+                "You are ReportWriterAgent for a PR review council.",
+                "Standardize the report into fixed JSON fields. Do not write free-form Markdown.",
+                "Use short factual sentences. Avoid rhetorical style, marketing language, or literary polish.",
+                "The downstream AI judge should score evidence quality, not writing style.",
+                f"Report language: {language}",
+                "Return JSON only in this shape:",
+                json.dumps(schema, ensure_ascii=False),
+                "Report context:",
+                json.dumps(report_context, ensure_ascii=False)[:50000],
+            ]
+        )
+        payload = self._chat_json("report-writer", self._system_prompt("report-writer"), prompt)
+        return payload if isinstance(payload, dict) else {}
+
+    def judge_report(
+        self,
+        judge_input: dict[str, Any],
+        diff: str,
+        pr_description: str,
+    ) -> dict[str, Any]:
+        schema = {
+            "overall_score": 85,
+            "verdict": "pass",
+            "dimensions": {
+                "critical_issue_coverage": 0,
+                "evidence_quality": 0,
+                "severity_accuracy": 0,
+                "duplicate_noise_control": 0,
+                "actionability": 0,
+                "report_clarity": 0,
+            },
+            "strengths": ["short point"],
+            "weaknesses": ["short point"],
+            "recommendations": ["short point"],
+        }
+        prompt = "\n".join(
+            [
+                "You are an independent AI judge for PR review quality.",
+                "Ignore writing polish and rhetorical style. Score only review quality and evidence quality.",
+                "Penalize duplicate findings, unsupported claims, severity inflation, and missed critical issues.",
+                "Score each dimension from 0 to 100. Return JSON only in this shape:",
+                json.dumps(schema, ensure_ascii=False),
+                "PR description:",
+                pr_description[:8000],
+                "Standardized judge input:",
+                json.dumps(judge_input, ensure_ascii=False)[:50000],
+                "Diff:",
+                truncate(diff, MAX_DIFF_CHARS),
+            ]
+        )
+        payload = self._chat_json("ai-judge", self._system_prompt("ai-judge"), prompt)
+        return payload if isinstance(payload, dict) else {}
+
+    def next_action(
+        self,
+        agent_state: dict[str, Any],
+        skill_context: str,
+        tools: list[dict[str, Any]],
+        observations: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        tool_names = {tool["name"] for tool in tools}
+        while self._pending_actions:
+            queued = self._pending_actions.pop(0)
+            normalized = self._normalize_action(queued, tool_names)
+            if normalized:
+                self.transcript.emit(
+                    "llm.queued_action",
+                    provider=self.provider,
+                    reviewer="agentic-reviewer.next_action",
+                    action=normalized["action"],
+                    remaining=len(self._pending_actions),
+                )
+                return normalized
+
+        schema = {
+            "thought": "short private planning summary",
+            "action": "call_tool",
+            "tool": "changed_files",
+            "args": {},
+        }
+        prompt = "\n".join(
+            [
+                "You are running an autonomous read-only PR review loop.",
+                "Choose exactly one next action. Do not follow a fixed workflow if another action is more useful.",
+                "Allowed actions:",
+                "- update_todos: include todos=[{content,status}] with status pending/in_progress/completed",
+                "- call_tool: include tool and args",
+                "- emit_finding: include finding with file,line,severity,category,title,evidence,impact,suggestion",
+                "- ask_critic: include finding_id for an existing candidate finding",
+                "- finalize: include reason when enough investigation has been done",
+                "You may return either one JSON action or a JSON array of independent next actions.",
+                "When returning a batch, do not include finalize; the runtime will execute queued actions after each observation.",
+                "Do not report placeholder examples such as your_api_key in .env.example as leaked real secrets.",
+                "Return JSON only, using this object shape for each action:",
+                json.dumps(schema, ensure_ascii=False),
+                "Code-review skill instructions:",
+                truncate(skill_context, MAX_SKILL_CHARS),
+                "Available tools:",
+                json.dumps(tools, ensure_ascii=False)[:12000],
+                "Current agent state:",
+                json.dumps(agent_state, ensure_ascii=False)[:16000],
+                "Recent observations:",
+                json.dumps(observations[-8:], ensure_ascii=False)[:16000],
+            ]
+        )
+        payload = self._chat_json("agentic-reviewer.next_action", self._system_prompt("agentic-reviewer"), prompt)
+        if isinstance(payload, list):
+            actions = [item for item in payload if isinstance(item, dict)]
+            if not actions:
+                return {}
+            payload = actions[0]
+            self._last_extra_json_payloads.extend(actions[1:])
+        if not isinstance(payload, dict):
+            return {}
+        self._enqueue_extra_actions(tool_names)
+        normalized = self._normalize_action(payload, tool_names)
+        if normalized:
+            return normalized
+        self.transcript.emit(
+            "llm.invalid_action",
+            provider=self.provider,
+            reviewer="agentic-reviewer.next_action",
+            raw=truncate(json.dumps(payload, ensure_ascii=False), 2000),
+        )
+        repair_prompt = "\n".join(
+            [
+                "The previous response was not a valid action for the PR review agent.",
+                "Rewrite it as exactly one valid JSON action with no commentary.",
+                "Allowed actions: update_todos, call_tool, emit_finding, ask_critic, finalize.",
+                "For call_tool use fields: action, tool, args.",
+                "For finalize use fields: action, reason.",
+                "Available tool names:",
+                json.dumps(sorted(tool_names), ensure_ascii=False),
+                "Invalid response:",
+                json.dumps(payload, ensure_ascii=False)[:4000],
+            ]
+        )
+        repaired = self._chat_json(
+            "agentic-reviewer.repair_action",
+            self._system_prompt("agentic-reviewer"),
+            repair_prompt,
+        )
+        if not isinstance(repaired, dict):
+            return {}
+        normalized = self._normalize_action(repaired, tool_names)
+        if not normalized:
+            self.transcript.emit(
+                "llm.invalid_action",
+                provider=self.provider,
+                reviewer="agentic-reviewer.repair_action",
+                raw=truncate(json.dumps(repaired, ensure_ascii=False), 2000),
+            )
+        return normalized
+
+    def _enqueue_extra_actions(self, tool_names: set[str]) -> None:
+        queued: list[dict[str, Any]] = []
+        for payload in self._last_extra_json_payloads:
+            if not isinstance(payload, dict):
+                continue
+            normalized = self._normalize_action(payload, tool_names)
+            if normalized and normalized["action"] != "finalize":
+                queued.append(payload)
+        if not queued:
+            return
+        self._pending_actions.extend(queued)
+        self.transcript.emit(
+            "llm.action_queue.extend",
+            provider=self.provider,
+            reviewer="agentic-reviewer.next_action",
+            count=len(queued),
+            pending=len(self._pending_actions),
+        )
+
     def _system_prompt(self, agent_name: str) -> str:
         base = "Return only valid JSON. Do not include markdown fences or commentary."
         prompts = {
@@ -1202,6 +1806,13 @@ class AliyunDashScopeClient(LLMClient):
                 "You are the lead reviewer making final resolutions after specialist review and critic review. "
                 "Accept only findings supported by concrete evidence from the diff or source context. "
                 "Reject weak or unrelated findings; downgrade overstated severity. "
+                "Reject findings that treat documented placeholders such as your_api_key in .env.example as leaked real secrets. "
+                + base
+            ),
+            "lead-reviewer.debate": (
+                "You are a debate controller for a multi-agent PR review council. "
+                "Your job is to improve review quality through targeted challenge, defense, evidence gathering, "
+                "deduplication, and final resolution. Optimize for true critical coverage, low noise, and clear evidence. "
                 + base
             ),
             "security-reviewer": (
@@ -1232,6 +1843,24 @@ class AliyunDashScopeClient(LLMClient):
                 "You are a skeptical review critic. Your job is not to find new issues, but to verify whether "
                 "a proposed finding is well-supported, scoped to the diff, correctly categorized, and assigned "
                 "an appropriate severity. Challenge weak evidence, vague impact, wrong severity, or non-actionable findings. "
+                "Challenge findings that confuse example placeholders with real committed credentials. "
+                + base
+            ),
+            "agentic-reviewer": (
+                "You are an autonomous read-only PR review agent inspired by Claude Code and Codex. "
+                "Use an observe-think-act loop: update todos, call tools, inspect observations, gather evidence, "
+                "ask the critic for risky findings, and finalize only when you have enough evidence. "
+                "Never modify files. Prefer targeted tool calls over fixed reviewer pipelines. "
+                + base
+            ),
+            "report-writer": (
+                "You are a structured report writer agent. Produce only standardized JSON fields. "
+                "Use plain factual language and avoid style flourishes so evaluation scores reflect review quality. "
+                + base
+            ),
+            "ai-judge": (
+                "You are an independent evaluator of PR review reports. Ignore writing polish and score evidence, "
+                "coverage of critical issues, severity accuracy, duplicate/noise control, and actionability. "
                 + base
             ),
         }
@@ -1290,10 +1919,56 @@ class AliyunDashScopeClient(LLMClient):
         try:
             return json.loads(cleaned)
         except json.JSONDecodeError:
+            objects = self._parse_sequential_json_objects(cleaned)
+            if objects:
+                self._last_extra_json_payloads = objects[1:]
+                if self._last_extra_json_payloads:
+                    self.transcript.emit(
+                        "llm.extra_json_queued",
+                        count=len(self._last_extra_json_payloads),
+                    )
+                return objects[0]
+
             match = re.search(r"\{.*\}", cleaned, flags=re.S)
             if not match:
                 raise
-            return json.loads(match.group(0))
+            matched = match.group(0)
+            try:
+                return json.loads(matched)
+            except json.JSONDecodeError:
+                objects = self._parse_sequential_json_objects(matched)
+                if not objects:
+                    raise
+                self._last_extra_json_payloads = objects[1:]
+                if self._last_extra_json_payloads:
+                    self.transcript.emit(
+                        "llm.extra_json_queued",
+                        count=len(self._last_extra_json_payloads),
+                    )
+                return objects[0]
+
+    def _parse_sequential_json_objects(self, text: str) -> list[Any]:
+        decoder = json.JSONDecoder()
+        objects: list[Any] = []
+        index = 0
+        while index < len(text):
+            while index < len(text) and text[index].isspace():
+                index += 1
+            if index >= len(text):
+                break
+            try:
+                value, end_index = decoder.raw_decode(text, index)
+            except json.JSONDecodeError:
+                if objects:
+                    self.transcript.emit(
+                        "llm.trailing_text_ignored",
+                        ignored_chars=len(text) - index,
+                        preview=truncate(text[index:], 500),
+                    )
+                break
+            objects.append(value)
+            index = end_index
+        return objects
 
     def _parse_findings_payload(self, payload: Any) -> list[Finding]:
         if isinstance(payload, dict):
@@ -1311,6 +1986,138 @@ class AliyunDashScopeClient(LLMClient):
             except ValueError:
                 continue
         return collector.sorted()
+
+    def _normalize_action(self, payload: dict[str, Any], tool_names: set[str]) -> dict[str, Any]:
+        action = str(payload.get("action", "")).strip()
+        aliases = {
+            "tool_call": "call_tool",
+            "use_tool": "call_tool",
+            "create_finding": "emit_finding",
+            "report_finding": "emit_finding",
+            "critic": "ask_critic",
+            "finish": "finalize",
+            "done": "finalize",
+            "final": "finalize",
+        }
+        action = aliases.get(action, action)
+        if action in tool_names:
+            args = payload.get("args", payload.get("parameters"))
+            if not isinstance(args, dict):
+                args = {
+                    key: value
+                    for key, value in payload.items()
+                    if key not in {"thought", "action", "tool", "tool_name"}
+                }
+            payload = {**payload, "action": "call_tool", "tool": action, "args": args}
+            action = "call_tool"
+        if action not in {"update_todos", "call_tool", "emit_finding", "ask_critic", "finalize"}:
+            return {}
+        normalized: dict[str, Any] = {
+            "thought": str(payload.get("thought", "")).strip()[:1200],
+            "action": action,
+        }
+        if action == "update_todos":
+            todos = payload.get("todos")
+            if not isinstance(todos, list):
+                return {}
+            normalized["todos"] = todos
+        elif action == "call_tool":
+            tool = str(payload.get("tool") or payload.get("tool_name") or "").strip()
+            if tool not in tool_names:
+                return {}
+            args = payload.get("args", payload.get("parameters", {}))
+            normalized["tool"] = tool
+            normalized["args"] = args if isinstance(args, dict) else {}
+        elif action == "emit_finding":
+            finding = payload.get("finding")
+            if not isinstance(finding, dict):
+                return {}
+            try:
+                Finding(**finding).validate()
+            except (TypeError, ValueError):
+                return {}
+            normalized["finding"] = finding
+        elif action == "ask_critic":
+            finding_id = str(payload.get("finding_id", "")).strip()
+            finding = payload.get("finding")
+            if finding_id:
+                normalized["finding_id"] = finding_id
+            elif isinstance(finding, dict):
+                normalized["finding"] = finding
+            else:
+                return {}
+        elif action == "finalize":
+            normalized["reason"] = str(payload.get("reason", "")).strip()[:1200] or "Agent decided review is complete."
+        return normalized
+
+
+    def _normalize_debate_action(self, payload: dict[str, Any]) -> dict[str, Any]:
+        action = str(payload.get("action", "")).strip()
+        aliases = {
+            "critic": "ask_critic",
+            "challenge": "ask_critic",
+            "defense": "request_reviewer_defense",
+            "more_evidence": "request_more_evidence",
+            "revise": "revise_finding",
+            "merge": "merge_duplicates",
+            "accept": "accept_finding",
+            "reject": "reject_finding",
+            "report_writer": "ask_report_writer",
+            "finish": "finalize",
+            "done": "finalize",
+        }
+        action = aliases.get(action, action)
+        allowed = {
+            "ask_critic",
+            "request_reviewer_defense",
+            "request_more_evidence",
+            "revise_finding",
+            "merge_duplicates",
+            "accept_finding",
+            "reject_finding",
+            "ask_report_writer",
+            "finalize",
+        }
+        if action not in allowed:
+            return {}
+        normalized: dict[str, Any] = {
+            "thought": str(payload.get("thought", "")).strip()[:1200],
+            "action": action,
+            "reason": str(payload.get("reason", "")).strip()[:1200],
+        }
+        if action in {
+            "ask_critic",
+            "request_reviewer_defense",
+            "request_more_evidence",
+            "accept_finding",
+            "reject_finding",
+        }:
+            finding_id = str(payload.get("finding_id", "")).strip()
+            if not finding_id:
+                return {}
+            normalized["finding_id"] = finding_id
+        elif action == "revise_finding":
+            finding_id = str(payload.get("finding_id", "")).strip()
+            finding = payload.get("finding")
+            if not finding_id or not isinstance(finding, dict):
+                return {}
+            try:
+                Finding(**finding).validate()
+            except (TypeError, ValueError):
+                return {}
+            normalized["finding_id"] = finding_id
+            normalized["finding"] = finding
+        elif action == "merge_duplicates":
+            source_id = str(payload.get("source_id") or payload.get("duplicate_id") or "").strip()
+            target_id = str(payload.get("target_id") or payload.get("canonical_id") or "").strip()
+            if not source_id or not target_id or source_id == target_id:
+                return {}
+            normalized["source_id"] = source_id
+            normalized["target_id"] = target_id
+        elif action == "finalize":
+            normalized["reason"] = normalized["reason"] or "Debate controller decided review is complete."
+        return normalized
+
 
 class ReviewAgentMember:
     def __init__(
@@ -1415,6 +2222,435 @@ class CriticReviewer:
                     "No challenge; evidence is sufficient.",
                     item.finding_id,
                 )
+
+
+class AgenticReviewLoop:
+    def __init__(
+        self,
+        tools: ReviewTools,
+        transcript: Transcript,
+        collector: FindingCollector,
+        todos: TodoManager,
+        critic_pass: bool = True,
+        llm_client: LLMClient | None = None,
+        skill_context: str = "",
+        test_command: str | None = None,
+        max_steps: int = 20,
+    ):
+        self.tools = tools
+        self.transcript = transcript
+        self.collector = collector
+        self.todos = todos
+        self.critic_pass = critic_pass
+        self.llm_client = llm_client
+        self.skill_context = skill_context
+        self.test_command = test_command
+        self.max_steps = max_steps
+        self.bus = MessageBus(transcript)
+        self.evidence = EvidenceStore(transcript)
+        self.lifecycle = FindingLifecycle(transcript)
+        self.critic = CriticReviewer(self.bus, self.evidence, self.lifecycle, llm_client, skill_context)
+        self.observations: list[dict[str, Any]] = []
+
+    def run(self, pr_description: str = "") -> dict[str, Any]:
+        self.transcript.emit("agentic.start", max_steps=self.max_steps)
+        self._set_default_todos()
+        if not self.llm_client or not self.llm_client.enabled:
+            self.transcript.emit("agentic.fallback", reason="llm unavailable")
+            return self._run_local_guardrails()
+
+        finalized = False
+        for step in range(1, self.max_steps + 1):
+            action = self.llm_client.next_action(
+                self._agent_state(pr_description, step),
+                self.skill_context,
+                self._available_tools(),
+                self.observations,
+            )
+            if not action:
+                action = self._recovery_action()
+                self.transcript.emit("agent.recovery_action", step=step, **action)
+            self.transcript.emit("agent.action", step=step, **action)
+            observation = self._apply_action(action)
+            self.observations.append(observation)
+            self.transcript.emit("agent.observation", step=step, **observation)
+            if action["action"] == "finalize":
+                finalized = True
+                break
+
+        if not finalized:
+            self.transcript.emit("agent.finalize", reason="max steps reached")
+        self._coverage_review(pr_description)
+        self._resolve_candidates("Agentic review finalized.")
+        records = [item.to_dict(self.evidence.list(item.finding_id)) for item in self.lifecycle.all()]
+        self.transcript.emit("agentic.complete", candidates=len(records), accepted=len(self.lifecycle.accepted()))
+        return {"findings": records, "messages": self.bus.all()}
+
+    def _recovery_action(self) -> dict[str, Any]:
+        called_tools = [obs.get("tool") for obs in self.observations if obs.get("type") == "tool"]
+        if "changed_files" not in called_tools:
+            return {
+                "thought": "Recover from invalid LLM action by inspecting changed files.",
+                "action": "call_tool",
+                "tool": "changed_files",
+                "args": {},
+            }
+        if "git_diff" not in called_tools:
+            return {
+                "thought": "Recover from invalid LLM action by reading the diff.",
+                "action": "call_tool",
+                "tool": "git_diff",
+                "args": {},
+            }
+        return {
+            "thought": "Recover from repeated invalid LLM action by finalizing with gathered evidence.",
+            "action": "finalize",
+            "reason": "LLM returned invalid actions after useful observations were gathered.",
+        }
+
+    def _set_default_todos(self) -> None:
+        self.todos.update(
+            [
+                {"content": "Inspect PR context with read-only tools", "status": "in_progress"},
+                {"content": "Investigate risky changes and collect evidence", "status": "pending"},
+                {"content": "Ask critic for weak or merge-blocking findings", "status": "pending"},
+                {"content": "Finalize accepted findings and write report", "status": "pending"},
+            ]
+        )
+        self.transcript.emit("todo.update", todos=self.todos.items)
+
+    def _available_tools(self) -> list[dict[str, Any]]:
+        allowed = {"git_diff", "changed_files", "read_file_context", "run_tests", "secret_scan", "search_code", "risk_scan"}
+        return [tool for tool in TOOLS if tool["name"] in allowed]
+
+    def _agent_state(self, pr_description: str, step: int) -> dict[str, Any]:
+        return {
+            "step": step,
+            "max_steps": self.max_steps,
+            "repo": str(self.tools.repo),
+            "base": self.tools.base,
+            "target": self.tools.target,
+            "pr_description": pr_description[:6000],
+            "todos": self.todos.items,
+            "candidate_findings": [
+                item.to_dict(self.evidence.list(item.finding_id)) for item in self.lifecycle.all()
+            ],
+            "test_command_available": bool(self.test_command),
+        }
+
+    def _apply_action(self, action: dict[str, Any]) -> dict[str, Any]:
+        kind = action["action"]
+        try:
+            if kind == "update_todos":
+                rendered = self.todos.update(action["todos"])
+                self.transcript.emit("todo.update", todos=self.todos.items)
+                return {"type": "todo_update", "ok": True, "result": rendered}
+            if kind == "call_tool":
+                return self._call_tool(action["tool"], action.get("args", {}))
+            if kind == "emit_finding":
+                item = self._emit_candidate(action["finding"], proposed_by="agentic-reviewer")
+                return {"type": "finding", "ok": True, "finding_id": item.finding_id}
+            if kind == "ask_critic":
+                return self._ask_critic(action)
+            if kind == "finalize":
+                self.transcript.emit("agent.finalize", reason=action.get("reason", "Agent finalized."))
+                return {"type": "finalize", "ok": True, "reason": action.get("reason", "")}
+        except Exception as exc:
+            return {"type": kind, "ok": False, "error": str(exc)}
+        return {"type": kind, "ok": False, "error": "Unknown action"}
+
+    def _call_tool(self, tool: str, args: dict[str, Any]) -> dict[str, Any]:
+        if tool == "git_diff":
+            result = self.tools.git_diff(args.get("base"), args.get("target"))
+        elif tool == "changed_files":
+            result = self.tools.changed_files(args.get("base"), args.get("target"))
+        elif tool == "read_file_context":
+            result = self.tools.read_file_context(
+                str(args.get("path", "")),
+                int(args.get("line", 1)),
+                int(args.get("radius", 4)),
+            )
+        elif tool == "run_tests":
+            if not self.test_command:
+                return {
+                    "type": "tool",
+                    "ok": False,
+                    "tool": tool,
+                    "error": "run_tests is disabled because --test-command was not provided",
+                }
+            result = self.tools.run_tests(self.test_command)
+        elif tool == "secret_scan":
+            result = self.tools.secret_scan()
+        elif tool == "search_code":
+            result = self.tools.search_code(
+                str(args.get("query", "")),
+                args.get("path"),
+                int(args.get("max_matches", 20)),
+            )
+        elif tool == "risk_scan":
+            result = self.tools.risk_scan()
+        else:
+            return {"type": "tool", "ok": False, "tool": tool, "error": "Tool is not allowed"}
+        return {"type": "tool", "ok": True, "tool": tool, "result": self._compact_result(result)}
+
+    def _compact_result(self, result: Any) -> Any:
+        if isinstance(result, str):
+            return truncate(result, 12000)
+        text = json.dumps(result, ensure_ascii=False)
+        if len(text) <= 12000:
+            return result
+        return {"truncated": True, "preview": truncate(text, 12000)}
+
+    def _emit_candidate(self, finding_payload: dict[str, Any], proposed_by: str) -> CouncilFinding:
+        finding = Finding(**finding_payload)
+        finding.validate()
+        item = self.lifecycle.candidate(finding, proposed_by)
+        self.evidence.add(item.finding_id, "reviewer_explanation", finding.impact, proposed_by)
+        self.evidence.add(item.finding_id, "diff_line", finding.evidence, proposed_by)
+        try:
+            context = self.tools.read_file_context(finding.file, finding.line, radius=3)
+            self.evidence.add(item.finding_id, "file_context", context, "evidence-store")
+        except Exception as exc:
+            self.evidence.add(item.finding_id, "file_context_error", str(exc), "evidence-store")
+        self.bus.send(
+            proposed_by,
+            "lead-reviewer",
+            "candidate_finding",
+            f"{finding.severity} {finding.category}: {finding.title}",
+            item.finding_id,
+        )
+        return item
+
+    def _coverage_review(self, pr_description: str) -> None:
+        if not self.llm_client or not self.llm_client.enabled:
+            return
+        try:
+            files = self.tools.changed_files()
+            diff = self.tools.git_diff()
+            risk_signals = self.tools.risk_scan()
+        except Exception as exc:
+            self.transcript.emit("agent.coverage_review.skipped", reason=str(exc))
+            return
+        existing = [item.to_dict(self.evidence.list(item.finding_id)) for item in self.lifecycle.all()]
+        findings = self.llm_client.coverage_review(
+            pr_description,
+            self.skill_context,
+            diff,
+            files,
+            existing,
+            [*self.observations, {"type": "tool", "tool": "risk_scan", "ok": True, "result": risk_signals}],
+        )
+        added = 0
+        skipped = 0
+        for finding in findings:
+            if self._is_duplicate_finding(finding):
+                skipped += 1
+                continue
+            self._emit_candidate(asdict(finding), proposed_by="agentic-coverage-reviewer")
+            added += 1
+        promoted = 0
+        for signal in risk_signals:
+            finding = self._finding_from_risk_signal(signal)
+            if not finding or self._is_duplicate_finding(finding):
+                continue
+            self._emit_candidate(asdict(finding), proposed_by="risk-scan-tool")
+            promoted += 1
+        self.transcript.emit(
+            "agent.coverage_review.complete",
+            proposed=len(findings),
+            added=added,
+            skipped_duplicates=skipped,
+            promoted_risk_signals=promoted,
+        )
+
+    def _is_duplicate_finding(self, finding: Finding) -> bool:
+        normalized_evidence = re.sub(r"\s+", " ", finding.evidence.strip().lower())
+        normalized_title = re.sub(r"\s+", " ", finding.title.strip().lower())
+        for item in self.lifecycle.all():
+            existing = item.finding
+            if existing.file != finding.file:
+                continue
+            existing_evidence = re.sub(r"\s+", " ", existing.evidence.strip().lower())
+            existing_title = re.sub(r"\s+", " ", existing.title.strip().lower())
+            if existing.line == finding.line and existing.category == finding.category:
+                return True
+            if normalized_evidence and normalized_evidence == existing_evidence:
+                return True
+            if existing.line == finding.line and normalized_title == existing_title:
+                return True
+        return False
+
+    def _finding_from_risk_signal(self, signal: dict[str, Any]) -> Finding | None:
+        file = str(signal.get("file", ""))
+        line = int(signal.get("line", 1) or 1)
+        evidence = str(signal.get("evidence", "")).strip()
+        name = str(signal.get("signal", ""))
+        templates: dict[str, dict[str, str]] = {
+            "sql_interpolation": {
+                "severity": "P1",
+                "category": "security",
+                "title": "SQL query interpolates user-controlled values",
+                "impact": "Interpolating request data into SQL can allow injection or unintended data access.",
+                "suggestion": "Use the parameter binding API for the actual database driver.",
+            },
+            "shell_execution": {
+                "severity": "P1",
+                "category": "security",
+                "title": "Shell command uses formatted runtime values",
+                "impact": "Using shell=True with formatted values can turn crafted input into command execution.",
+                "suggestion": "Avoid shell=True and pass an argument list to subprocess.",
+            },
+            "mutable_default": {
+                "severity": "P2",
+                "category": "correctness",
+                "title": "Mutable default argument can leak state between calls",
+                "impact": "The same object is reused across calls, which can leak state between requests or events.",
+                "suggestion": "Default to None and allocate the list or dict inside the function.",
+            },
+            "swallowed_exception": {
+                "severity": "P2",
+                "category": "correctness",
+                "title": "Exception is swallowed without recovery",
+                "impact": "Failures disappear and the function can continue with misleading fallback behavior.",
+                "suggestion": "Catch specific exceptions and either handle, log, or re-raise them.",
+            },
+            "sensitive_logging": {
+                "severity": "P1",
+                "category": "security",
+                "title": "Sensitive values are written to logs",
+                "impact": "Tokens, signatures, or card data in logs can be exposed through monitoring or support tooling.",
+                "suggestion": "Remove sensitive fields from logs or redact them before logging.",
+            },
+            "signature_mismatch_not_rejected": {
+                "severity": "P1",
+                "category": "security",
+                "title": "Webhook signature mismatch is not rejected",
+                "impact": "Invalidly signed webhook events can continue through the handler and be accepted.",
+                "suggestion": "Return an error or raise before processing when signature verification fails.",
+            },
+            "trust_bypass_pattern": {
+                "severity": "P2",
+                "category": "correctness",
+                "title": "Test-prefix shortcut can trust unintended merchants",
+                "impact": "Production merchant IDs matching the test prefix can bypass normal risk checks.",
+                "suggestion": "Restrict test shortcuts to non-production environments or explicit fixtures.",
+            },
+            "risk_rule_approves_high_risk_case": {
+                "severity": "P2",
+                "category": "correctness",
+                "title": "High-risk country branch approves payments",
+                "impact": "A risk rule can approve payments from high-risk countries instead of escalating review.",
+                "suggestion": "Revisit the business rule and require manual review unless there is documented policy.",
+            },
+            "negative_amount_refund": {
+                "severity": "P2",
+                "category": "correctness",
+                "title": "Refund handler returns negative amount",
+                "impact": "Downstream systems may double-negate or misinterpret negative refund amounts.",
+                "suggestion": "Use an explicit event type and normalized positive amount contract.",
+            },
+        }
+        if name.startswith("missing_test_"):
+            templates[name] = {
+                "severity": "P2",
+                "category": "testing",
+                "title": "Missing test coverage for critical changed behavior",
+                "impact": "Risk-sensitive behavior changed without a targeted regression test.",
+                "suggestion": "Add a focused test that exercises this branch and asserts the expected outcome.",
+            }
+        template = templates.get(name)
+        if not template or not file or not evidence:
+            return None
+        return Finding(
+            file=file,
+            line=line,
+            severity=template["severity"],
+            category=template["category"],
+            title=template["title"],
+            evidence=evidence,
+            impact=template["impact"],
+            suggestion=template["suggestion"],
+        )
+
+    def _ask_critic(self, action: dict[str, Any]) -> dict[str, Any]:
+        finding_id = action.get("finding_id", "")
+        if not finding_id and isinstance(action.get("finding"), dict):
+            finding_id = self._emit_candidate(action["finding"], proposed_by="agentic-reviewer").finding_id
+        item = next((candidate for candidate in self.lifecycle.all() if candidate.finding_id == finding_id), None)
+        if not item:
+            return {"type": "critic", "ok": False, "error": f"Unknown finding_id: {finding_id}"}
+        if not self.critic_pass:
+            return {"type": "critic", "ok": True, "finding_id": finding_id, "result": "critic disabled"}
+        self.bus.send(
+            "agentic-reviewer",
+            "critic-reviewer",
+            "task_assignment",
+            "Challenge this candidate finding if evidence or severity is weak.",
+            finding_id,
+        )
+        self.critic.review([item])
+        return {
+            "type": "critic",
+            "ok": True,
+            "finding_id": finding_id,
+            "status": item.status,
+            "evidence_chain": self.evidence.list(finding_id),
+        }
+
+    def _resolve_candidates(self, default_reason: str) -> None:
+        for item in self.lifecycle.all():
+            evidence_chain = self.evidence.list(item.finding_id)
+            resolution = (
+                self.llm_client.resolve_finding(item, evidence_chain, self.skill_context)
+                if self.llm_client and self.llm_client.enabled
+                else {}
+            )
+            if resolution:
+                self.evidence.add(
+                    item.finding_id,
+                    "lead_resolution",
+                    f"{resolution['resolution']}: {resolution['reason']}",
+                    "lead-reviewer",
+                )
+                if resolution["resolution"] == "rejected":
+                    self.lifecycle.reject(item.finding_id, resolution["reason"])
+                elif resolution["resolution"] == "downgraded":
+                    self.lifecycle.downgrade(item.finding_id, resolution["severity"], resolution["reason"])
+                else:
+                    self.lifecycle.accept(item.finding_id, resolution["reason"])
+            elif item.status == "challenged":
+                self.lifecycle.accept(item.finding_id, f"{default_reason} Critic challenge reviewed.")
+            else:
+                self.lifecycle.accept(item.finding_id, default_reason)
+        for item in self.lifecycle.accepted():
+            self.collector.emit(item.finding)
+
+    def _run_local_guardrails(self) -> dict[str, Any]:
+        self.transcript.emit("agent.action", step=0, action="call_tool", tool="changed_files", args={})
+        files = self.tools.changed_files()
+        obs = {"type": "tool", "ok": True, "tool": "changed_files", "result": files}
+        self.observations.append(obs)
+        self.transcript.emit("agent.observation", step=0, **obs)
+        self.transcript.emit("agent.action", step=0, action="call_tool", tool="git_diff", args={})
+        diff = self.tools.git_diff()
+        obs = {"type": "tool", "ok": True, "tool": "git_diff", "result": truncate(diff, 12000)}
+        self.observations.append(obs)
+        self.transcript.emit("agent.observation", step=0, **obs)
+        test_result = self.tools.run_tests(self.test_command) if self.test_command else None
+        reviewers = SpecialtyReviewers(self.tools, self.collector, self.transcript)
+        for reviewer in ("security-reviewer", "correctness-reviewer", "test-reviewer", "maintainability-reviewer"):
+            reviewers.run(reviewer, diff, files, test_result)
+        self.transcript.emit("agent.finalize", reason="LLM unavailable; used local guardrails fallback.")
+        self.todos.update(
+            [
+                {"content": "Inspect PR context with read-only tools", "status": "completed"},
+                {"content": "Run local guardrail reviewers", "status": "completed"},
+                {"content": "Finalize accepted findings and write report", "status": "completed"},
+            ]
+        )
+        self.transcript.emit("todo.update", todos=self.todos.items)
+        self.transcript.emit("agentic.complete", candidates=0, accepted=len(self.collector.findings), fallback=True)
+        return {"findings": [], "messages": []}
 
 
 class ReviewCouncil:
@@ -1561,6 +2797,321 @@ class ReviewCouncil:
                 reason = "Accepted by lead reviewer after evidence review."
                 self.lifecycle.accept(item.finding_id, reason)
                 self.bus.send("lead-reviewer", item.proposed_by, "resolution", reason, item.finding_id)
+
+
+class DebateCouncilLoop:
+    def __init__(
+        self,
+        tools: ReviewTools,
+        transcript: Transcript,
+        collector: FindingCollector,
+        critic_pass: bool = True,
+        llm_client: LLMClient | None = None,
+        skill_context: str = "",
+        max_actions: int = 12,
+        language: str = "zh",
+    ):
+        self.tools = tools
+        self.transcript = transcript
+        self.collector = collector
+        self.critic_pass = critic_pass
+        self.llm_client = llm_client
+        self.skill_context = skill_context
+        self.max_actions = max_actions
+        self.language = language
+        self.bus = MessageBus(transcript)
+        self.evidence = EvidenceStore(transcript)
+        self.lifecycle = FindingLifecycle(transcript)
+        self.members = [
+            ReviewAgentMember("security-reviewer", "Security risk reviewer", tools, transcript, llm_client),
+            ReviewAgentMember("correctness-reviewer", "Correctness and edge-case reviewer", tools, transcript, llm_client),
+            ReviewAgentMember("test-reviewer", "Test coverage reviewer", tools, transcript, llm_client),
+            ReviewAgentMember("maintainability-reviewer", "Maintainability reviewer", tools, transcript, llm_client),
+        ]
+        self.critic = CriticReviewer(self.bus, self.evidence, self.lifecycle, llm_client, skill_context)
+        self.observations: list[dict[str, Any]] = []
+        self.report_writer_notes: dict[str, Any] = {}
+        self._fallback_critic_ids: set[str] = set()
+
+    def run(
+        self,
+        diff: str,
+        files: list[dict[str, Any]],
+        test_result: dict[str, Any] | None,
+        pr_description: str = "",
+    ) -> dict[str, Any]:
+        if not self.llm_client or not self.llm_client.enabled:
+            self.transcript.emit("debate.fallback", reason="llm unavailable")
+            council = ReviewCouncil(
+                self.tools,
+                self.transcript,
+                self.collector,
+                self.critic_pass,
+                self.llm_client,
+                self.skill_context,
+            )
+            return council.run(diff, files, test_result, pr_description)
+
+        self.transcript.emit(
+            "debate.start",
+            members=[member.name for member in self.members],
+            max_actions=self.max_actions,
+        )
+        self._seed_candidates(diff, files, test_result, pr_description)
+        finalized = False
+        for step in range(1, self.max_actions + 1):
+            action = self.llm_client.next_debate_action(
+                self._debate_state(step, pr_description, files, test_result),
+                self.skill_context,
+            )
+            if not action:
+                action = self._fallback_debate_action()
+            self.transcript.emit("debate.action", step=step, **action)
+            observation = self._apply_debate_action(action)
+            self.observations.append(observation)
+            self.transcript.emit("debate.observation", step=step, **observation)
+            if action["action"] == "finalize":
+                finalized = True
+                break
+        if not finalized:
+            self.transcript.emit("debate.finalize", reason="max actions reached")
+
+        self._resolve_remaining()
+        for item in self.lifecycle.accepted():
+            self.collector.emit(item.finding)
+
+        records = [item.to_dict(self.evidence.list(item.finding_id)) for item in self.lifecycle.all()]
+        self.transcript.emit("debate.complete", candidates=len(records), accepted=len(self.lifecycle.accepted()))
+        return {
+            "findings": records,
+            "messages": self.bus.all(),
+            "report_writer_notes": self.report_writer_notes,
+        }
+
+    def _seed_candidates(
+        self,
+        diff: str,
+        files: list[dict[str, Any]],
+        test_result: dict[str, Any] | None,
+        pr_description: str,
+    ) -> None:
+        review_plan = self.llm_client.plan_review(pr_description, self.skill_context, diff, files, test_result)
+        if review_plan:
+            self.transcript.emit("debate.plan", assignments=review_plan)
+        self.bus.send(
+            "lead-reviewer",
+            "all",
+            "task_assignment",
+            "Submit candidate findings with concrete evidence. Debate will challenge weak or duplicate items.",
+        )
+        for member in self.members:
+            focus = review_plan.get(member.name, f"Scope: {member.role}. Submit only actionable findings.")
+            self.bus.send("lead-reviewer", member.name, "task_assignment", focus)
+            findings = member.review(diff, files, test_result, focus, self.skill_context)
+            print(f"[debate] {member.name} proposed {len(findings)} candidate finding(s)")
+            for finding in findings:
+                item = self.lifecycle.candidate(finding, member.name)
+                self.evidence.add(item.finding_id, "reviewer_explanation", finding.impact, member.name)
+                self.evidence.add(item.finding_id, "diff_line", finding.evidence, member.name)
+                try:
+                    context = self.tools.read_file_context(finding.file, finding.line, radius=3)
+                    self.evidence.add(item.finding_id, "file_context", context, "evidence-store")
+                except Exception as exc:
+                    self.evidence.add(item.finding_id, "file_context_error", str(exc), "evidence-store")
+                self.bus.send(
+                    member.name,
+                    "lead-reviewer",
+                    "candidate_finding",
+                    f"{finding.severity} {finding.category}: {finding.title}",
+                    item.finding_id,
+                )
+
+    def _debate_state(
+        self,
+        step: int,
+        pr_description: str,
+        files: list[dict[str, Any]],
+        test_result: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        return {
+            "step": step,
+            "max_actions": self.max_actions,
+            "pr_description": pr_description[:6000],
+            "changed_files": files,
+            "test_result": test_result or {},
+            "findings": [item.to_dict(self.evidence.list(item.finding_id)) for item in self.lifecycle.all()],
+            "messages": self.bus.all()[-30:],
+            "recent_observations": self.observations[-10:],
+            "quality_goal": "maximize true critical coverage while minimizing duplicates, unsupported claims, and severity inflation",
+        }
+
+    def _fallback_debate_action(self) -> dict[str, Any]:
+        candidate = next(
+            (
+                item
+                for item in self.lifecycle.all()
+                if item.status == "candidate" and item.finding_id not in self._fallback_critic_ids
+            ),
+            None,
+        )
+        if candidate and self.critic_pass:
+            self._fallback_critic_ids.add(candidate.finding_id)
+            return {
+                "thought": "Fallback asks critic to verify the next unresolved candidate.",
+                "action": "ask_critic",
+                "finding_id": candidate.finding_id,
+                "reason": "LLM debate action was unavailable.",
+            }
+        unresolved = next((item for item in self.lifecycle.all() if item.status in {"candidate", "challenged"}), None)
+        if unresolved:
+            return {
+                "thought": "Fallback accepts candidate after available evidence review.",
+                "action": "accept_finding",
+                "finding_id": unresolved.finding_id,
+                "reason": "Evidence chain is sufficient for fallback resolution.",
+            }
+        return {
+            "thought": "No unresolved candidates remain.",
+            "action": "finalize",
+            "reason": "Debate has no unresolved candidates.",
+        }
+
+    def _apply_debate_action(self, action: dict[str, Any]) -> dict[str, Any]:
+        kind = action["action"]
+        try:
+            if kind == "ask_critic":
+                return self._ask_critic(action["finding_id"])
+            if kind == "request_reviewer_defense":
+                return self._request_reviewer_defense(action["finding_id"], action.get("reason", ""))
+            if kind == "request_more_evidence":
+                return self._request_more_evidence(action["finding_id"], action.get("reason", ""))
+            if kind == "revise_finding":
+                finding = Finding(**action["finding"])
+                item = self.lifecycle.revise(action["finding_id"], finding, action.get("reason", "Revised by debate controller."))
+                self.evidence.add(item.finding_id, "lead_revision", action.get("reason", ""), "lead-reviewer")
+                return {"type": "revise", "ok": True, "finding_id": item.finding_id}
+            if kind == "merge_duplicates":
+                source_id = action["source_id"]
+                target_id = action["target_id"]
+                reason = action.get("reason", f"Duplicate of {target_id}.")
+                self.lifecycle.reject(source_id, reason)
+                self.evidence.add(source_id, "duplicate_merge", f"Merged into {target_id}: {reason}", "lead-reviewer")
+                self.bus.send("lead-reviewer", "report-writer", "resolution", reason, source_id)
+                return {"type": "merge", "ok": True, "source_id": source_id, "target_id": target_id}
+            if kind == "accept_finding":
+                item = self.lifecycle.accept(action["finding_id"], action.get("reason", "Accepted by debate controller."))
+                self.bus.send("lead-reviewer", item.proposed_by, "resolution", item.resolution_reason, item.finding_id)
+                return {"type": "resolution", "ok": True, "finding_id": item.finding_id, "status": item.status}
+            if kind == "reject_finding":
+                item = self.lifecycle.reject(action["finding_id"], action.get("reason", "Rejected by debate controller."))
+                self.bus.send("lead-reviewer", item.proposed_by, "resolution", item.resolution_reason, item.finding_id)
+                return {"type": "resolution", "ok": True, "finding_id": item.finding_id, "status": item.status}
+            if kind == "ask_report_writer":
+                context = self._report_context()
+                self.report_writer_notes = self.llm_client.report_writer_review(context, self.language) if self.llm_client else {}
+                self.transcript.emit("debate.report_writer", chars=len(json.dumps(self.report_writer_notes, ensure_ascii=False)))
+                self.bus.send("lead-reviewer", "report-writer", "task_assignment", action.get("reason", "Review final report quality."))
+                return {"type": "report_writer", "ok": True, "has_notes": bool(self.report_writer_notes)}
+            if kind == "finalize":
+                self.transcript.emit("debate.finalize", reason=action.get("reason", "Debate finalized."))
+                return {"type": "finalize", "ok": True, "reason": action.get("reason", "")}
+        except Exception as exc:
+            return {"type": kind, "ok": False, "error": str(exc)}
+        return {"type": kind, "ok": False, "error": "Unknown debate action"}
+
+    def _ask_critic(self, finding_id: str) -> dict[str, Any]:
+        item = self._find_item(finding_id)
+        if not item:
+            return {"type": "critic", "ok": False, "error": f"Unknown finding_id: {finding_id}"}
+        self.bus.send(
+            "lead-reviewer",
+            "critic-reviewer",
+            "task_assignment",
+            "Challenge this candidate if evidence, severity, or duplication is weak.",
+            finding_id,
+        )
+        self.critic.review([item])
+        return {
+            "type": "critic",
+            "ok": True,
+            "finding_id": finding_id,
+            "status": item.status,
+            "evidence_chain": self.evidence.list(finding_id),
+        }
+
+    def _request_reviewer_defense(self, finding_id: str, reason: str) -> dict[str, Any]:
+        item = self._find_item(finding_id)
+        if not item:
+            return {"type": "defense", "ok": False, "error": f"Unknown finding_id: {finding_id}"}
+        chain = self.evidence.list(finding_id)
+        challenge = reason or item.resolution_reason or "Please defend, revise, or withdraw this finding."
+        self.bus.send("lead-reviewer", item.proposed_by, "evidence_request", challenge, finding_id)
+        response = self.llm_client.reviewer_defense(item.proposed_by, item, challenge, chain, self.skill_context) if self.llm_client else {}
+        if not response:
+            defense = f"Defense: {len(chain)} evidence item(s) support this finding."
+            self.evidence.add(finding_id, "reviewer_defense", defense, item.proposed_by)
+            self.bus.send(item.proposed_by, "lead-reviewer", "defense", defense, finding_id)
+            return {"type": "defense", "ok": True, "finding_id": finding_id, "decision": "defend"}
+        decision = response["decision"]
+        self.evidence.add(finding_id, "reviewer_defense", response["reason"], item.proposed_by)
+        self.bus.send(item.proposed_by, "lead-reviewer", "defense", response["reason"], finding_id)
+        if decision == "withdraw":
+            self.lifecycle.reject(finding_id, response["reason"])
+        elif decision == "revise" and isinstance(response.get("finding"), dict):
+            self.lifecycle.revise(finding_id, Finding(**response["finding"]), response["reason"])
+        return {"type": "defense", "ok": True, "finding_id": finding_id, "decision": decision}
+
+    def _request_more_evidence(self, finding_id: str, reason: str) -> dict[str, Any]:
+        item = self._find_item(finding_id)
+        if not item:
+            return {"type": "evidence", "ok": False, "error": f"Unknown finding_id: {finding_id}"}
+        try:
+            context = self.tools.read_file_context(item.finding.file, item.finding.line, radius=6)
+        except Exception as exc:
+            self.evidence.add(finding_id, "extra_evidence_error", str(exc), "evidence-store")
+            return {"type": "evidence", "ok": False, "finding_id": finding_id, "error": str(exc)}
+        self.evidence.add(finding_id, "extra_file_context", context, "evidence-store")
+        self.bus.send("lead-reviewer", item.proposed_by, "evidence_request", reason or "Extra evidence was collected.", finding_id)
+        return {"type": "evidence", "ok": True, "finding_id": finding_id, "result": truncate(context, 1200)}
+
+    def _resolve_remaining(self) -> None:
+        for item in self.lifecycle.all():
+            if item.status in {"accepted", "rejected", "downgraded"}:
+                continue
+            evidence_chain = self.evidence.list(item.finding_id)
+            resolution = self.llm_client.resolve_finding(item, evidence_chain, self.skill_context) if self.llm_client else {}
+            if resolution:
+                self.evidence.add(
+                    item.finding_id,
+                    "lead_resolution",
+                    f"{resolution['resolution']}: {resolution['reason']}",
+                    "lead-reviewer",
+                )
+                if resolution["resolution"] == "rejected":
+                    self.lifecycle.reject(item.finding_id, resolution["reason"])
+                elif resolution["resolution"] == "downgraded":
+                    self.lifecycle.downgrade(item.finding_id, resolution["severity"], resolution["reason"])
+                else:
+                    self.lifecycle.accept(item.finding_id, resolution["reason"])
+            elif item.status == "challenged":
+                self.lifecycle.reject(item.finding_id, item.resolution_reason or "Rejected after unresolved challenge.")
+            else:
+                self.lifecycle.accept(item.finding_id, "Accepted by debate fallback after evidence review.")
+
+    def _report_context(self) -> dict[str, Any]:
+        return {
+            "findings": [item.to_dict(self.evidence.list(item.finding_id)) for item in self.lifecycle.all()],
+            "messages": self.bus.all(),
+            "observations": self.observations,
+            "quality_rules": [
+                "Do not reward duplicate findings.",
+                "Prefer evidence-backed severe issues.",
+                "Keep report style standardized for judge fairness.",
+            ],
+        }
+
+    def _find_item(self, finding_id: str) -> CouncilFinding | None:
+        return next((item for item in self.lifecycle.all() if item.finding_id == finding_id), None)
 
 
 ZH_CATEGORY = {
@@ -1739,6 +3290,145 @@ class ReportWriter:
         return {"report": str(report_path), "findings": str(findings_path)}
 
 
+class ReportWriterAgent:
+    def __init__(
+        self,
+        llm_client: LLMClient | None,
+        transcript: Transcript,
+        language: str = "zh",
+    ):
+        self.llm_client = llm_client
+        self.transcript = transcript
+        self.language = language
+
+    def draft(self, report_context: dict[str, Any]) -> dict[str, Any]:
+        payload = (
+            self.llm_client.report_writer_review(report_context, self.language)
+            if self.llm_client and self.llm_client.enabled
+            else {}
+        )
+        draft = self._normalize(payload, report_context)
+        self.transcript.emit(
+            "report_writer.draft",
+            llm_used=bool(payload),
+            accepted=len(draft["accepted_findings"]),
+            rejected=len(draft["rejected_findings"]),
+            downgraded=len(draft["downgraded_findings"]),
+        )
+        return draft
+
+    def _normalize(self, payload: dict[str, Any], report_context: dict[str, Any]) -> dict[str, Any]:
+        fallback = self._fallback(report_context)
+        if not isinstance(payload, dict):
+            return fallback
+        verdict = str(payload.get("verdict") or fallback["verdict"]).strip()
+        if verdict not in VERDICTS:
+            verdict = fallback["verdict"]
+        return {
+            "report_style": "standardized",
+            "verdict": verdict,
+            "summary_points": self._list_of_strings(payload.get("summary_points")) or fallback["summary_points"],
+            "accepted_findings": self._normalize_standard_findings(payload.get("accepted_findings"))
+            or fallback["accepted_findings"],
+            "rejected_findings": self._normalize_standard_findings(payload.get("rejected_findings"))
+            or fallback["rejected_findings"],
+            "downgraded_findings": self._normalize_standard_findings(payload.get("downgraded_findings"))
+            or fallback["downgraded_findings"],
+            "duplicate_notes": self._list_of_strings(payload.get("duplicate_notes")) or fallback["duplicate_notes"],
+            "critic_notes": self._list_of_strings(payload.get("critic_notes")) or fallback["critic_notes"],
+        }
+
+    def _fallback(self, report_context: dict[str, Any]) -> dict[str, Any]:
+        records = report_context.get("council_records") or report_context.get("findings") or []
+        accepted = [
+            self._standard_finding(record, "Accepted by lead reviewer.")
+            for record in records
+            if record.get("status") == "accepted"
+        ]
+        downgraded = [
+            self._standard_finding(record, "Downgraded by lead reviewer.")
+            for record in records
+            if record.get("status") == "downgraded"
+        ]
+        rejected = [
+            self._standard_finding(record, "Rejected by lead reviewer.")
+            for record in records
+            if record.get("status") == "rejected"
+        ]
+        severities = {item["severity"] for item in accepted + downgraded}
+        verdict = "request_changes" if severities & {"P0", "P1"} else ("comment" if severities else "approve")
+        if accepted or downgraded:
+            summary = [f"{len(accepted) + len(downgraded)} accepted or downgraded finding(s)."]
+        else:
+            summary = ["No blocking findings accepted."]
+        duplicate_notes = [
+            f"{record.get('finding_id')} rejected as duplicate/noise."
+            for record in records
+            if record.get("status") == "rejected" and "duplicate" in str(record.get("resolution_reason", "")).lower()
+        ]
+        critic_notes = [
+            evidence.get("content", "")
+            for record in records
+            for evidence in record.get("evidence_chain", [])
+            if evidence.get("source") in {"critic_review", "critic_challenge"}
+        ][:12]
+        return {
+            "report_style": "standardized",
+            "verdict": verdict,
+            "summary_points": summary,
+            "accepted_findings": accepted,
+            "rejected_findings": rejected,
+            "downgraded_findings": downgraded,
+            "duplicate_notes": duplicate_notes,
+            "critic_notes": critic_notes,
+        }
+
+    def _normalize_standard_findings(self, value: Any) -> list[dict[str, Any]]:
+        if not isinstance(value, list):
+            return []
+        normalized = []
+        for item in value:
+            if not isinstance(item, dict):
+                continue
+            normalized.append(
+                {
+                    "issue": str(item.get("issue", "")).strip()[:300],
+                    "severity": str(item.get("severity", "")).strip() if str(item.get("severity", "")).strip() in SEVERITIES else "P3",
+                    "file": str(item.get("file", "")).strip(),
+                    "line": int(item.get("line", 1) or 1),
+                    "evidence": str(item.get("evidence", "")).strip()[:1200],
+                    "impact": str(item.get("impact", "")).strip()[:1200],
+                    "fix": str(item.get("fix", "")).strip()[:1200],
+                    "why_accepted": str(item.get("why_accepted", "")).strip()[:1200],
+                    "critic_notes": str(item.get("critic_notes", "")).strip()[:1200],
+                }
+            )
+        return [item for item in normalized if item["issue"] and item["file"] and item["evidence"]]
+
+    def _standard_finding(self, record: dict[str, Any], default_reason: str) -> dict[str, Any]:
+        critic_notes = [
+            evidence.get("content", "")
+            for evidence in record.get("evidence_chain", [])
+            if evidence.get("source") in {"critic_review", "critic_challenge"}
+        ]
+        return {
+            "issue": str(record.get("title", "")),
+            "severity": str(record.get("severity", "P3")),
+            "file": str(record.get("file", "")),
+            "line": int(record.get("line", 1) or 1),
+            "evidence": str(record.get("evidence", "")),
+            "impact": str(record.get("impact", "")),
+            "fix": str(record.get("suggestion", "")),
+            "why_accepted": str(record.get("resolution_reason") or default_reason),
+            "critic_notes": " ".join(critic_notes)[:1200],
+        }
+
+    def _list_of_strings(self, value: Any) -> list[str]:
+        if not isinstance(value, list):
+            return []
+        return [str(item).strip()[:500] for item in value if str(item).strip()]
+
+
 class CouncilReportWriter:
     def __init__(
         self,
@@ -1747,12 +3437,14 @@ class CouncilReportWriter:
         language: str = "zh",
         council_records: list[dict[str, Any]] | None = None,
         council_messages: list[dict[str, Any]] | None = None,
+        standardized_report: dict[str, Any] | None = None,
     ):
         self.output_dir = output_dir
         self.collector = collector
         self.language = language
         self.council_records = council_records or []
         self.council_messages = council_messages or []
+        self.standardized_report = standardized_report or {}
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
     def verdict(self) -> str:
@@ -1803,6 +3495,7 @@ class CouncilReportWriter:
             "summary": self.summary(),
             "verdict": verdict,
             "findings": self._payload_findings(),
+            "standard_report": self.standardized_report,
             "council": {
                 "messages": self.council_messages,
                 "candidates": self.council_records,
@@ -1811,6 +3504,8 @@ class CouncilReportWriter:
 
     def markdown(self) -> str:
         payload = self.payload()
+        if self.standardized_report:
+            return self._standard_markdown(payload)
         if self.language == "zh":
             return self._markdown_zh(payload)
         lines = [
@@ -1823,6 +3518,71 @@ class CouncilReportWriter:
         ]
         self._append_council_process(lines, zh=False)
         self._append_findings(lines, payload, zh=False)
+        return "\n".join(lines).rstrip() + "\n"
+
+    def _standard_markdown(self, payload: dict[str, Any]) -> str:
+        report = self.standardized_report
+        zh = self.language == "zh"
+        title = "# PR 代码审查标准化报告" if zh else "# Standardized PR Review Report"
+        labels = {
+            "verdict": "结论" if zh else "Verdict",
+            "summary": "摘要" if zh else "Summary",
+            "accepted": "接受的问题" if zh else "Accepted Findings",
+            "downgraded": "降级的问题" if zh else "Downgraded Findings",
+            "rejected": "拒绝的问题" if zh else "Rejected Findings",
+            "duplicates": "重复/噪音说明" if zh else "Duplicate/Noise Notes",
+            "critic": "Critic 说明" if zh else "Critic Notes",
+            "evidence": "证据" if zh else "Evidence",
+            "impact": "影响" if zh else "Impact",
+            "fix": "修复建议" if zh else "Fix",
+            "why": "接受理由" if zh else "Why",
+        }
+        lines = [
+            title,
+            "",
+            f"**{labels['verdict']}:** `{report.get('verdict', payload['verdict'])}`",
+            "",
+            f"**Report Style:** `standardized`",
+            "",
+            f"## {labels['summary']}",
+            "",
+        ]
+        summary_points = report.get("summary_points") or [payload["summary"]]
+        lines.extend(f"- {point}" for point in summary_points)
+        lines.append("")
+        for section_key, section_label in (
+            ("accepted_findings", labels["accepted"]),
+            ("downgraded_findings", labels["downgraded"]),
+            ("rejected_findings", labels["rejected"]),
+        ):
+            findings = report.get(section_key) or []
+            lines.extend([f"## {section_label}", ""])
+            if not findings:
+                lines.append("无。" if zh else "None.")
+                lines.append("")
+                continue
+            for idx, finding in enumerate(findings, start=1):
+                lines.extend(
+                    [
+                        f"### {idx}. [{finding.get('severity')}] {finding.get('issue')}",
+                        "",
+                        f"- File: `{finding.get('file')}:{finding.get('line')}`",
+                        f"- {labels['evidence']}: {finding.get('evidence')}",
+                        f"- {labels['impact']}: {finding.get('impact')}",
+                        f"- {labels['fix']}: {finding.get('fix')}",
+                        f"- {labels['why']}: {finding.get('why_accepted')}",
+                        f"- {labels['critic']}: {finding.get('critic_notes') or 'none'}",
+                        "",
+                    ]
+                )
+        for key, label in (("duplicate_notes", labels["duplicates"]), ("critic_notes", labels["critic"])):
+            notes = report.get(key) or []
+            lines.extend([f"## {label}", ""])
+            if notes:
+                lines.extend(f"- {note}" for note in notes)
+            else:
+                lines.append("无。" if zh else "None.")
+            lines.append("")
         return "\n".join(lines).rstrip() + "\n"
 
     def _markdown_zh(self, payload: dict[str, Any]) -> str:
@@ -1903,12 +3663,127 @@ class CouncilReportWriter:
     def write(self) -> dict[str, str]:
         report_path = self.output_dir / REPORT_NAME
         findings_path = self.output_dir / FINDINGS_NAME
+        judge_input_path = self.output_dir / JUDGE_INPUT_NAME
         report_path.write_text(self.markdown(), encoding="utf-8")
-        findings_path.write_text(json.dumps(self.payload(), indent=2, ensure_ascii=False), encoding="utf-8")
-        return {"report": str(report_path), "findings": str(findings_path)}
+        payload = self.payload()
+        findings_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+        judge_input = {
+            "report_style": "standardized" if self.standardized_report else "legacy",
+            "standard_report": self.standardized_report,
+            "verdict": payload["verdict"],
+            "summary": payload["summary"],
+            "findings": payload["findings"],
+            "council": payload["council"],
+        }
+        judge_input_path.write_text(json.dumps(judge_input, indent=2, ensure_ascii=False), encoding="utf-8")
+        return {"report": str(report_path), "findings": str(findings_path), "judge_input": str(judge_input_path)}
 
 
 ReportWriter = CouncilReportWriter
+
+
+class JudgeRunner:
+    def __init__(
+        self,
+        repo: Path,
+        output_dir: Path,
+        transcript: Transcript,
+        llm_client: LLMClient | None,
+    ):
+        self.repo = repo
+        self.output_dir = output_dir
+        self.transcript = transcript
+        self.llm_client = llm_client
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+
+    def run(
+        self,
+        judge_report: Path,
+        base: str,
+        target: str,
+        pr_description: Path | None = None,
+    ) -> dict[str, str]:
+        path = judge_report if judge_report.is_absolute() else safe_repo_path(self.repo, str(judge_report))
+        judge_input = json.loads(path.read_text(encoding="utf-8"))
+        diff = self._git_diff(base, target)
+        description = ""
+        if pr_description:
+            description_path = pr_description if pr_description.is_absolute() else safe_repo_path(self.repo, str(pr_description))
+            description = description_path.read_text(encoding="utf-8", errors="replace")
+        raw = self.llm_client.judge_report(judge_input, diff, description) if self.llm_client and self.llm_client.enabled else {}
+        result = self._normalize(raw)
+        judge_path = self.output_dir / JUDGE_NAME
+        markdown_path = self.output_dir / JUDGE_REPORT_NAME
+        judge_path.write_text(json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8")
+        markdown_path.write_text(self._markdown(result), encoding="utf-8")
+        self.transcript.emit("judge.complete", score=result["overall_score"], verdict=result["verdict"])
+        return {"judge": str(judge_path), "judge_report": str(markdown_path)}
+
+    def _git_diff(self, base: str, target: str) -> str:
+        try:
+            return run_git(self.repo, ["diff", "--no-ext-diff", "--unified=80", base, target], timeout=60)
+        except Exception as exc:
+            self.transcript.emit("judge.diff_error", error=str(exc))
+            return ""
+
+    def _normalize(self, payload: dict[str, Any]) -> dict[str, Any]:
+        dimensions = {
+            "critical_issue_coverage": 0,
+            "evidence_quality": 0,
+            "severity_accuracy": 0,
+            "duplicate_noise_control": 0,
+            "actionability": 0,
+            "report_clarity": 0,
+        }
+        if isinstance(payload.get("dimensions"), dict):
+            for key in dimensions:
+                try:
+                    dimensions[key] = max(0, min(int(payload["dimensions"].get(key, 0)), 100))
+                except (TypeError, ValueError):
+                    dimensions[key] = 0
+        try:
+            overall = int(payload.get("overall_score", 0))
+        except (TypeError, ValueError):
+            overall = 0
+        overall = max(0, min(overall, 100))
+        verdict = str(payload.get("verdict", "needs_improvement")).strip()
+        if verdict not in {"pass", "needs_improvement", "fail"}:
+            verdict = "pass" if overall >= 80 else "needs_improvement"
+        return {
+            "overall_score": overall,
+            "verdict": verdict,
+            "dimensions": dimensions,
+            "strengths": self._list_of_strings(payload.get("strengths")),
+            "weaknesses": self._list_of_strings(payload.get("weaknesses")),
+            "recommendations": self._list_of_strings(payload.get("recommendations")),
+        }
+
+    def _list_of_strings(self, value: Any) -> list[str]:
+        if not isinstance(value, list):
+            return []
+        return [str(item).strip()[:500] for item in value if str(item).strip()]
+
+    def _markdown(self, result: dict[str, Any]) -> str:
+        lines = [
+            "# AI Judge Review Quality Report",
+            "",
+            f"**Overall Score:** {result['overall_score']}",
+            f"**Verdict:** `{result['verdict']}`",
+            "",
+            "## Dimensions",
+            "",
+        ]
+        for key, score in result["dimensions"].items():
+            lines.append(f"- `{key}`: {score}")
+        for key, title in (
+            ("strengths", "Strengths"),
+            ("weaknesses", "Weaknesses"),
+            ("recommendations", "Recommendations"),
+        ):
+            lines.extend(["", f"## {title}", ""])
+            items = result.get(key) or []
+            lines.extend(f"- {item}" for item in items) if items else lines.append("- None.")
+        return "\n".join(lines).rstrip() + "\n"
 
 
 class ReviewAgent:
@@ -1920,11 +3795,12 @@ class ReviewAgent:
         pr_description: Path | None = None,
         test_command: str | None = None,
         language: str = "zh",
-        mode: str = "council",
+        mode: str = "debate",
         critic_pass: bool = True,
         llm_provider: str = "aliyun",
         llm_model: str = "qwen-turbo-latest",
         llm_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        debate_max_actions: int = 12,
     ):
         self.repo = repo.resolve()
         self.base = base
@@ -1937,6 +3813,7 @@ class ReviewAgent:
         self.llm_provider = llm_provider
         self.llm_model = llm_model
         self.llm_base_url = llm_base_url
+        self.debate_max_actions = debate_max_actions
         self.output_dir = self.repo / OUTPUT_DIR_NAME
         self.transcript = Transcript(self.output_dir / TRANSCRIPT_NAME)
         self.collector = FindingCollector()
@@ -1950,12 +3827,15 @@ class ReviewAgent:
         self.llm_client = self._build_llm_client()
         self.reviewers = SpecialtyReviewers(self.tools, self.collector, self.transcript)
         self.council_result: dict[str, Any] = {"findings": [], "messages": []}
+        self.standardized_report: dict[str, Any] = {}
         self.tool_handlers: dict[str, Callable[..., Any]] = {
             "git_diff": self.tools.git_diff,
             "changed_files": self.tools.changed_files,
             "read_file_context": self.tools.read_file_context,
             "run_tests": self.tools.run_tests,
             "secret_scan": self.tools.secret_scan,
+            "search_code": self.tools.search_code,
+            "risk_scan": self.tools.risk_scan,
             "emit_finding": self.collector.emit,
             "write_report": lambda path=None: ReportWriter(
                 self.output_dir,
@@ -1963,6 +3843,7 @@ class ReviewAgent:
                 self.language,
                 self.council_result.get("findings", []),
                 self.council_result.get("messages", []),
+                self.standardized_report,
             ).write(),
         }
 
@@ -2024,49 +3905,119 @@ class ReviewAgent:
         if pr_description:
             self.transcript.emit("pr.description", chars=len(pr_description))
 
-        files = self.tools.changed_files()
-        diff = self.tools.git_diff()
-        test_result = self.tools.run_tests(self.test_command) if self.test_command else None
-
-        self.todos.update(
-            [
-                {"content": "Load code-review skill and understand PR context", "status": "completed"},
-                {"content": "Inspect changed files and diff", "status": "completed"},
-                {"content": "Run specialist review agents", "status": "in_progress"},
-                {"content": "Write Markdown and JSON report", "status": "pending"},
-            ]
-        )
-        self.transcript.emit("todo.update", todos=self.todos.items)
-
-        if self.mode == "simple":
-            for reviewer in ("security-reviewer", "correctness-reviewer", "test-reviewer"):
-                print(f"[agent] spawning {reviewer}")
-                print("[agent] " + self.reviewers.run(reviewer, diff, files, test_result))
-        else:
-            council = ReviewCouncil(
+        if self.mode == "agentic":
+            loop = AgenticReviewLoop(
                 tools=self.tools,
                 transcript=self.transcript,
                 collector=self.collector,
+                todos=self.todos,
                 critic_pass=self.critic_pass,
                 llm_client=self.llm_client,
                 skill_context=self.skill_context,
+                test_command=self.test_command,
             )
-            print("[agent] convening review council")
-            self.council_result = council.run(diff, files, test_result, pr_description)
-            print(
-                f"[agent] council accepted {len(self.collector.findings)} finding(s) "
-                f"from {len(self.council_result['findings'])} candidate(s)"
-            )
+            print("[agent] starting agentic review loop")
+            self.council_result = loop.run(pr_description)
+            print(f"[agent] agentic loop accepted {len(self.collector.findings)} finding(s)")
+        else:
+            files = self.tools.changed_files()
+            diff = self.tools.git_diff()
+            test_result = self.tools.run_tests(self.test_command) if self.test_command else None
 
-        self.todos.update(
-            [
-                {"content": "Load code-review skill and understand PR context", "status": "completed"},
-                {"content": "Inspect changed files and diff", "status": "completed"},
-                {"content": "Run specialist review agents", "status": "completed"},
+            self.todos.update(
+                [
+                    {"content": "Load code-review skill and understand PR context", "status": "completed"},
+                    {"content": "Inspect changed files and diff", "status": "completed"},
+                    {"content": "Run specialist review agents", "status": "in_progress"},
+                    {"content": "Write Markdown and JSON report", "status": "pending"},
+                ]
+            )
+            self.transcript.emit("todo.update", todos=self.todos.items)
+
+            if self.mode == "simple":
+                for reviewer in ("security-reviewer", "correctness-reviewer", "test-reviewer"):
+                    print(f"[agent] spawning {reviewer}")
+                    print("[agent] " + self.reviewers.run(reviewer, diff, files, test_result))
+            elif self.mode == "debate":
+                debate = DebateCouncilLoop(
+                    tools=self.tools,
+                    transcript=self.transcript,
+                    collector=self.collector,
+                    critic_pass=self.critic_pass,
+                    llm_client=self.llm_client,
+                    skill_context=self.skill_context,
+                    max_actions=self.debate_max_actions,
+                    language=self.language,
+                )
+                print("[agent] starting debate council loop")
+                self.council_result = debate.run(diff, files, test_result, pr_description)
+                print(
+                    f"[agent] debate council accepted {len(self.collector.findings)} finding(s) "
+                    f"from {len(self.council_result['findings'])} candidate(s)"
+                )
+            else:
+                council = ReviewCouncil(
+                    tools=self.tools,
+                    transcript=self.transcript,
+                    collector=self.collector,
+                    critic_pass=self.critic_pass,
+                    llm_client=self.llm_client,
+                    skill_context=self.skill_context,
+                )
+                print("[agent] convening review council")
+                self.council_result = council.run(diff, files, test_result, pr_description)
+                print(
+                    f"[agent] council accepted {len(self.collector.findings)} finding(s) "
+                    f"from {len(self.council_result['findings'])} candidate(s)"
+                )
+
+        if self.mode == "agentic":
+            final_todos = self.todos.items or [
+                {"content": "Run agentic review loop", "status": "completed"},
                 {"content": "Write Markdown and JSON report", "status": "in_progress"},
             ]
-        )
-        self.transcript.emit("todo.update", todos=self.todos.items)
+            if final_todos:
+                final_todos = [
+                    {
+                        "content": item["content"],
+                        "status": "completed" if item["status"] == "in_progress" else item["status"],
+                    }
+                    for item in final_todos
+                ]
+                if not any(item["content"] == "Write Markdown and JSON report" for item in final_todos):
+                    final_todos.append({"content": "Write Markdown and JSON report", "status": "in_progress"})
+                else:
+                    final_todos = [
+                        {
+                            "content": item["content"],
+                            "status": "in_progress" if item["content"] == "Write Markdown and JSON report" else item["status"],
+                        }
+                        for item in final_todos
+                    ]
+                self.todos.update(final_todos)
+                self.transcript.emit("todo.update", todos=self.todos.items)
+        else:
+            self.todos.update(
+                [
+                    {"content": "Load code-review skill and understand PR context", "status": "completed"},
+                    {"content": "Inspect changed files and diff", "status": "completed"},
+                    {"content": "Run specialist review agents", "status": "completed"},
+                    {"content": "Write Markdown and JSON report", "status": "in_progress"},
+                ]
+            )
+            self.transcript.emit("todo.update", todos=self.todos.items)
+
+        report_context = {
+            "mode": self.mode,
+            "council_records": self.council_result.get("findings", []),
+            "council_messages": self.council_result.get("messages", []),
+            "report_writer_notes": self.council_result.get("report_writer_notes", {}),
+        }
+        self.standardized_report = ReportWriterAgent(
+            self.llm_client,
+            self.transcript,
+            self.language,
+        ).draft(report_context)
 
         writer = ReportWriter(
             self.output_dir,
@@ -2074,19 +4025,29 @@ class ReviewAgent:
             self.language,
             self.council_result.get("findings", []),
             self.council_result.get("messages", []),
+            self.standardized_report,
         )
         paths = writer.write()
         payload = writer.payload()
         self.transcript.emit("review.complete", verdict=payload["verdict"], findings=len(payload["findings"]))
 
-        self.todos.update(
-            [
-                {"content": "Load code-review skill and understand PR context", "status": "completed"},
-                {"content": "Inspect changed files and diff", "status": "completed"},
-                {"content": "Run specialist review agents", "status": "completed"},
-                {"content": "Write Markdown and JSON report", "status": "completed"},
+        if self.mode == "agentic":
+            completed = [
+                {"content": item["content"], "status": "completed"}
+                for item in self.todos.items
+                if item.get("content") != "Write Markdown and JSON report"
             ]
-        )
+            completed.append({"content": "Write Markdown and JSON report", "status": "completed"})
+            self.todos.update(completed)
+        else:
+            self.todos.update(
+                [
+                    {"content": "Load code-review skill and understand PR context", "status": "completed"},
+                    {"content": "Inspect changed files and diff", "status": "completed"},
+                    {"content": "Run specialist review agents", "status": "completed"},
+                    {"content": "Write Markdown and JSON report", "status": "completed"},
+                ]
+            )
         self.transcript.emit("todo.update", todos=self.todos.items)
         return {**payload, "paths": paths}
 
@@ -2099,10 +4060,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--pr-description", help="Optional PR description markdown file.")
     parser.add_argument("--test-command", help="Optional test command to run, e.g. 'python -m pytest'.")
     parser.add_argument("--language", choices=["zh", "en"], default="zh", help="Report language.")
-    parser.add_argument("--mode", choices=["council", "simple"], default="council", help="Review execution mode.")
+    parser.add_argument("--mode", choices=["debate", "council", "agentic", "simple"], default="debate", help="Review execution mode.")
     parser.add_argument("--llm-provider", choices=["aliyun", "none"], default="aliyun", help="LLM provider for specialist reviewers.")
     parser.add_argument("--llm-model", default="qwen-turbo-latest", help="Aliyun DashScope model name, e.g. qwen-turbo-latest.")
     parser.add_argument("--llm-base-url", default="https://dashscope.aliyuncs.com/compatible-mode/v1", help="OpenAI-compatible DashScope base URL.")
+    parser.add_argument("--debate-max-actions", type=int, default=12, help="Maximum dynamic actions for debate council mode.")
+    parser.add_argument("--judge-report", help="Run AI judge on a standardized judge_input.json instead of running review.")
+    parser.add_argument("--judge-model", default="qwen-plus", help="Aliyun DashScope model for AI judge.")
     parser.add_argument(
         "--critic-pass",
         choices=["true", "false"],
@@ -2116,6 +4080,37 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     repo = Path(args.repo).resolve()
     pr_description = Path(args.pr_description) if args.pr_description else None
+    load_env_file(repo / ".env")
+    if args.judge_report:
+        output_dir = repo / OUTPUT_DIR_NAME
+        transcript = Transcript(output_dir / JUDGE_TRANSCRIPT_NAME)
+        llm_client: LLMClient | None
+        if args.llm_provider == "none":
+            llm_client = None
+            transcript.emit("llm.disabled", provider="none")
+        else:
+            llm_client = AliyunDashScopeClient(
+                api_key=os.getenv("DASHSCOPE_API_KEY"),
+                model=args.judge_model,
+                base_url=args.llm_base_url,
+                transcript=transcript,
+            )
+            transcript.emit(
+                "llm.configure",
+                provider=llm_client.provider,
+                model=llm_client.model,
+                base_url=llm_client.base_url,
+                enabled=llm_client.enabled,
+            )
+        paths = JudgeRunner(repo, output_dir, transcript, llm_client).run(
+            Path(args.judge_report),
+            args.base,
+            args.target,
+            pr_description,
+        )
+        print(f"[judge] output: {paths['judge']}")
+        print(f"[judge] report: {paths['judge_report']}")
+        return 0
     agent = ReviewAgent(
         repo=repo,
         base=args.base,
@@ -2128,6 +4123,7 @@ def main(argv: list[str] | None = None) -> int:
         llm_provider=args.llm_provider,
         llm_model=args.llm_model,
         llm_base_url=args.llm_base_url,
+        debate_max_actions=args.debate_max_actions,
     )
     result = agent.run()
     print(f"[agent] verdict: {result['verdict']}")

@@ -1,264 +1,329 @@
 # PR Review Agent Council
 
-一个面向中文学习者和项目展示场景的 **LLM-first 多 Agent PR 代码审查系统**。项目基于 Python 实现，接入阿里云 DashScope / Qwen，并借鉴 `learn-claude-code` 中的 Agent 工程思想，把一次 PR Review 拆成“工具调用、任务规划、多角色审查、反驳质检、最终裁决、可追踪输出”等完整流程。
+面向中文用户的 **Debate Council PR Review Agent**。项目基于 `learn-claude-code` 的 Agent 工程思路改造，用 Python + Aliyun DashScope/Qwen 实现一个只读 PR Review Agent：读取 Git diff 和 PR 描述，组织多个 reviewer 生成候选问题，再通过 debate loop 对 finding 进行质疑、补证、反驳、合并和裁决，最后输出标准化报告，并可用 AI Judge 做质量评估。
 
-如果你是第一次看这个项目，建议先读：
+当前默认模式是 `--mode debate`。旧的 `--mode council` 仍然保留，作为固定 workflow baseline，方便复现、教学和效果对比。
 
-- [中文教程：Agent 简历与面试](docs/中文教程-Agent简历面试.md)
-- [Demo PR 描述](docs/demo-pr.md)
+本项目适合用来学习：
 
-这个项目适合用于学习和展示以下能力：
+- 多 Agent 协作审查代码。
+- Tool Calling 和只读代码工具设计。
+- Skill Loading 如何把审查规范注入 prompt。
+- Debate Loop 如何区别于固定 workflow。
+- ReportWriterAgent 如何把 LLM 输出约束为固定 JSON。
+- AI Judge 如何作为 review quality 的辅助评价指标。
 
-- 如何把 LLM 接入真实工程流程，而不是只做一次简单问答。
-- 如何设计 Multi-Agent System，让不同 Agent 承担不同审查职责。
-- 如何使用 Tool Calling 获取 Git diff、变更文件、测试结果和上下文。
-- 如何用 Skill Loading 把审查规范注入到 Agent prompt 中。
-- 如何用 EvidenceStore、FindingLifecycle 和 JSONL Trace 让 Agent 输出可解释、可追踪。
+详细中文教程见：[docs/中文教程-Agent简历面试.md](docs/中文教程-Agent简历面试.md)
 
-## 项目亮点
+## 功能概览
 
-- **LLM-first 多 Agent 审查**：Lead Reviewer、Security Reviewer、Correctness Reviewer、Test Reviewer、Maintainability Reviewer、Critic Reviewer 都围绕 LLM 推理工作。
-- **阿里云 DashScope / Qwen 接入**：通过 OpenAI-compatible Chat Completions API 调用 Qwen 模型，默认模型为 `qwen-turbo-latest`。
-- **Claude Code 风格 Agent 工程模式**：借鉴 `learn-claude-code` 的 Tool Calling、Skill、Todo Tracking、Transcript Trace 等思路。
-- **Tool Calling**：Agent 不直接“凭空猜”，而是先调用工具收集 Git diff、变更文件、文件上下文、测试输出等信息。
-- **Skill Loading**：从 `skills/code-review/SKILL.md` 加载代码审查技能，并注入 Lead、Specialist、Critic、Resolution 等 prompt。
-- **Multi-Agent 通信机制**：通过 MessageBus 记录任务分配、候选问题、质疑、辩护和最终裁决。
-- **证据链审查**：每个 finding 都绑定 diff line、文件上下文、reviewer rationale、critic challenge 和 lead resolution。
-- **Finding Lifecycle**：支持 `candidate -> challenged -> accepted / rejected / downgraded` 的问题生命周期。
-- **结构化输出**：要求 LLM 输出 JSON，再经过 schema validation 和 fallback 逻辑处理，便于 CI 或平台集成。
-- **可观测性**：所有工具调用、LLM 请求、Agent 消息、证据和裁决都会写入 `.review-agent/transcript.jsonl`。
+- **默认 Debate 模式**：`--mode debate`，保留 council 的 reviewer 团队，但让 Lead Debate Controller 动态决定下一步 action。
+- **旧 Council 模式**：`--mode council`，固定流程 baseline，便于对比升级前后的效果。
+- **Agentic 模式**：`--mode agentic`，全局 ReAct 风格只读 agent loop，作为实验模式保留。
+- **Simple 模式**：`--mode simple`，本地规则兜底，不依赖 LLM。
+- **Critic Reviewer**：对候选 finding 提出挑战，检查证据、严重级别和误报风险。
+- **ReportWriterAgent**：必须走固定 JSON schema，Markdown 由程序模板渲染，减少文笔差异对评估的影响。
+- **AI Judge**：独立命令触发，默认 `qwen-plus`，读取 `judge_input.json`，按固定 rubric 评分。
+- **Transcript Observability**：所有 action、observation、message、evidence、resolution 都写入 JSONL trace。
 
-## 架构流程图
+## 新旧模式流程图
+
+旧版 `--mode council` 是固定委员会 workflow，适合作为 baseline 理解：
 
 ```mermaid
 flowchart TD
-    A["输入<br/>repo + base/target + PR 描述"] --> B["ReviewAgent<br/>总控编排器"]
-    B --> C["SkillLoader<br/>加载 code-review skill"]
-    B --> D["ReviewTools<br/>git diff / changed files / context / tests"]
-    B --> E["AliyunDashScopeClient<br/>Qwen Chat Completions"]
+    A["输入<br/>repo + base/target + PR 描述"] --> B["ReviewAgent"]
+    B --> C["ReviewTools<br/>读取 diff / changed files / file context"]
+    B --> D["SkillLoader<br/>加载 code-review skill"]
+    B --> E["LLM Client<br/>Qwen / fallback"]
 
-    C --> F["skill_context<br/>共享审查规范"]
-    D --> G["Lead Reviewer<br/>LLM 制定审查计划"]
-    E --> G
-    F --> G
+    C --> F["ReviewCouncil<br/>固定编排"]
+    D --> F
+    E --> F
 
-    G --> H["Security Reviewer<br/>安全审查"]
-    G --> I["Correctness Reviewer<br/>正确性审查"]
-    G --> J["Test Reviewer<br/>测试审查"]
-    G --> K["Maintainability Reviewer<br/>可维护性审查"]
+    F --> G["Lead Reviewer<br/>生成 review focus"]
+    G --> H["Security Reviewer"]
+    G --> I["Correctness Reviewer"]
+    G --> J["Test Reviewer"]
+    G --> K["Maintainability Reviewer"]
 
-    H --> L["Candidate Findings<br/>候选问题"]
+    H --> L["Candidate Findings"]
     I --> L
     J --> L
     K --> L
 
-    L --> M["EvidenceStore<br/>保存证据链"]
-    L --> N["FindingLifecycle<br/>问题生命周期"]
-    M --> O["Critic Reviewer<br/>LLM 质疑弱证据问题"]
-    F --> O
-    O --> P["Lead Reviewer<br/>LLM 最终裁决"]
-    M --> P
-    N --> P
-
-    P --> Q["ReportWriter<br/>报告生成"]
-    Q --> R["report.md"]
-    Q --> S["findings.json"]
-    Q --> T["transcript.jsonl"]
-
-    U["MessageBus<br/>Agent 间消息记录"] -.-> G
-    U -.-> H
-    U -.-> I
-    U -.-> J
-    U -.-> K
-    U -.-> O
-    U -.-> P
+    L --> M["EvidenceStore<br/>绑定 diff line 和上下文"]
+    M --> N["Critic Reviewer<br/>一轮质疑"]
+    N --> O["Lead Reviewer<br/>一轮裁决"]
+    O --> P["Accepted / Rejected / Downgraded"]
+    P --> Q["ReportWriter"]
+    Q --> R["report.md / findings.json / transcript.jsonl"]
 ```
 
-## 工作流程
+当前默认 `--mode debate` 保留 reviewer 团队，但把 finding 质量控制升级为动态 debate loop：
 
-1. `ReviewAgent` 读取 `.env`、PR 描述、Git diff、变更文件和 `code-review` skill。
-2. `Lead Reviewer` 调用 Qwen，基于 PR 信息制定审查计划。
-3. `Security / Correctness / Test / Maintainability Reviewers` 分别调用 Qwen，按职责审查代码。
-4. 本地规则作为 guardrails 补充，用来捕获硬编码密钥、SQL 拼接、`shell=True`、可变默认参数、吞异常等高置信风险。
-5. `EvidenceStore` 为每个候选问题保存 diff 行、文件上下文和 reviewer 解释。
-6. `Critic Reviewer` 调用 Qwen 对候选问题进行质疑，过滤证据不足或夸大的 finding。
-7. `Lead Reviewer` 再次调用 Qwen，结合证据和 critic 结果做最终裁决。
-8. `ReportWriter` 输出 Markdown 报告、结构化 JSON 和 JSONL 运行轨迹。
+```mermaid
+flowchart TD
+    A["输入<br/>repo + base/target + PR 描述"] --> B["ReviewAgent"]
+    B --> C["SkillLoader<br/>加载 code-review skill"]
+    B --> D["ReviewTools<br/>git_diff / changed_files / read_file_context / search_code / secret_scan"]
+    B --> E["AliyunDashScopeClient<br/>Qwen / DashScope"]
 
-## 目录结构
+    C --> F["skill_context"]
+    D --> G["DebateCouncilLoop<br/>默认模式"]
+    E --> G
+    F --> G
 
-```text
-agents/review_agent.py              # 核心实现：工具、LLM client、Agent council、报告输出
-skills/code-review/SKILL.md         # 代码审查 skill：审查清单、严重级别、finding schema
-demo/pr-fixture/payment_risk.py     # 支付风控 Demo PR，包含多类真实审查风险
-docs/demo-pr.md                     # Demo PR 描述
-docs/中文教程-Agent简历面试.md        # 中文教程、简历写法、面试问答
-tests/test_review_agent.py          # 单元测试和集成测试
+    G --> H["Specialist Reviewers<br/>Security / Correctness / Test / Maintainability"]
+    H --> I["Candidate Findings"]
+    I --> J["EvidenceStore<br/>diff line + file context + critic notes"]
+    I --> K["FindingLifecycle<br/>candidate / challenged / accepted / rejected / downgraded"]
+
+    K --> L["Lead Debate Controller<br/>动态选择下一步 action"]
+    L --> M{"Debate Action"}
+    M --> M1["ask_critic"]
+    M --> M2["request_reviewer_defense"]
+    M --> M3["request_more_evidence"]
+    M --> M4["revise_finding"]
+    M --> M5["merge_duplicates"]
+    M --> M6["accept / reject / finalize"]
+
+    M1 --> N["CriticReviewer"]
+    M2 --> O["Reviewer Defense"]
+    M3 --> J
+    M4 --> K
+    M5 --> K
+    M6 --> K
+    N --> J
+    O --> J
+    J --> L
+
+    K --> P["Accepted Findings"]
+    P --> Q["ReportWriterAgent<br/>固定 JSON schema"]
+    Q --> R["Template Renderer<br/>标准化 Markdown"]
+    R --> S["report.md"]
+    R --> T["findings.json"]
+    R --> U["judge_input.json"]
+
+    U --> V["AI Judge<br/>qwen-plus，一次性评估"]
+    V --> W["judge.json / judge.md"]
+
+    G --> X["transcript.jsonl"]
 ```
 
-## 环境要求
+## 安装与复现
 
-- Python 3.10 或更高版本。
-- Git，用于生成 diff 和读取变更文件。
-- 可选：阿里云 DashScope API Key，用于真实调用 Qwen。
-
-项目主程序只使用 Python 标准库；为了运行测试和复现示例，建议安装 `requirements.txt` 中的依赖。
-
-## 快速开始
-
-### 1. 克隆项目
+### 1. 克隆并安装依赖
 
 ```bash
 git clone https://github.com/csy-csy123/pr-review-agent-council.git
 cd pr-review-agent-council
+python -m venv .venv
 ```
 
-如果你是在本地已有目录中运行，直接进入项目根目录即可。
-
-### 2. 创建虚拟环境
-
-Windows PowerShell：
+Windows PowerShell:
 
 ```powershell
-python -m venv .venv
 .\.venv\Scripts\Activate.ps1
-```
-
-macOS / Linux：
-
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-```
-
-### 3. 安装依赖
-
-```bash
 python -m pip install -U pip
 python -m pip install -r requirements.txt
 ```
 
-说明：当前项目运行时代码只依赖 Python 标准库，`requirements.txt` 主要用于安装 `pytest`，方便运行测试和验证项目。
+macOS / Linux:
 
-### 4. 配置 DashScope
+```bash
+source .venv/bin/activate
+python -m pip install -U pip
+python -m pip install -r requirements.txt
+```
 
-在项目根目录创建 `.env`，可以参考 `.env.example`：
+### 2. 配置 DashScope API Key
+
+复制 `.env.example` 为 `.env`，然后填入自己的 key：
 
 ```text
 DASHSCOPE_API_KEY=your_dashscope_api_key
 ```
 
-程序启动时会自动读取 `.env`，然后创建 Qwen LLM client。
+程序启动时会读取 `.env` 中的 `DASHSCOPE_API_KEY`。
 
-如果暂时没有 API Key，也可以使用 `--llm-provider none` 先跑本地规则版本。
+如果只想本地体验，不调用大模型，可以运行时加：
 
-### 5. 运行测试
+```bash
+--llm-provider none
+```
+
+### 3. 运行测试
 
 ```bash
 python -m pytest -p no:cacheprovider
 ```
 
-### 6. 运行 Agent 审查
+当前测试覆盖 debate loop、agentic loop、工具调用、report writer、AI Judge fallback、council/simple 兼容逻辑等。
 
-运行完整的 Qwen 多 Agent 审查：
+项目运行代码主要使用 Python 标准库；`requirements.txt` 中的 `pytest` 用于复现测试和验证。
 
-```bash
-python agents/review_agent.py --repo . --base HEAD~1 --target HEAD --pr-description docs/demo-pr.md --language zh --llm-provider aliyun
-```
+## 快速运行
 
-只运行本地确定性规则，不调用 LLM：
+### 默认：Debate Council Agent
 
 ```bash
-python agents/review_agent.py --repo . --base HEAD~1 --target HEAD --pr-description docs/demo-pr.md --language zh --llm-provider none
+python agents/review_agent.py --repo . --base HEAD~1 --target HEAD --pr-description docs/demo-pr.md --language zh
 ```
 
-## 常用参数
+这等价于：
+
+```bash
+python agents/review_agent.py --repo . --base HEAD~1 --target HEAD --pr-description docs/demo-pr.md --language zh --mode debate
+```
+
+### 旧模式：Council Baseline
+
+```bash
+python agents/review_agent.py --repo . --base HEAD~1 --target HEAD --pr-description docs/demo-pr.md --language zh --mode council
+```
+
+这个模式保留固定流程：多个 reviewer 先审查，critic 再质疑，lead reviewer 再裁决。它适合作为 baseline，用来解释为什么后来升级为 debate loop。
+
+### 全局 ReAct 实验模式：Agentic
+
+```bash
+python agents/review_agent.py --repo . --base HEAD~1 --target HEAD --pr-description docs/demo-pr.md --language zh --mode agentic
+```
+
+这个模式让主 Agent 动态选择工具和下一步动作，更接近通用 ReAct agent，但在 PR review 场景下，默认推荐使用 `debate`，因为它保留了 reviewer 分工覆盖，同时把最关键的 finding 质量控制做成动态 loop。
+
+### 本地兜底：Simple
+
+```bash
+python agents/review_agent.py --repo . --base HEAD~1 --target HEAD --pr-description docs/demo-pr.md --language zh --mode simple --llm-provider none
+```
+
+## 使用 Demo PR 复现
+
+如果你的当前 `HEAD~1..HEAD` 不是 demo 代码，可以先找到项目内置 demo commit：
+
+```bash
+git log --format=%H --grep "Demo PR with payment risks" --max-count=1
+```
+
+假设输出为 `<demo_commit>`，则运行：
+
+```bash
+python agents/review_agent.py --repo . --base <demo_commit>^ --target <demo_commit> --pr-description docs/demo-pr.md --language zh --mode debate
+```
+
+旧 council 对照：
+
+```bash
+python agents/review_agent.py --repo . --base <demo_commit>^ --target <demo_commit> --pr-description docs/demo-pr.md --language zh --mode council
+```
+
+## AI Judge 评估
+
+普通 review 不会自动调用 AI Judge。先运行一次 review，生成 `.review-agent/judge_input.json`，再显式执行：
+
+```bash
+python agents/review_agent.py --judge-report .review-agent/judge_input.json --repo . --base HEAD~1 --target HEAD --pr-description docs/demo-pr.md
+```
+
+默认 judge model 是 `qwen-plus`，也可以指定：
+
+```bash
+python agents/review_agent.py --judge-report .review-agent/judge_input.json --repo . --base HEAD~1 --target HEAD --pr-description docs/demo-pr.md --judge-model qwen-plus
+```
+
+AI Judge 不是 ground truth。它的定位是一个自动化 evaluation proxy：在固定输入、固定 JSON schema、固定 rubric、固定模型下，对不同 agent 策略做可追踪的相对比较。更严谨的评估还应该结合人工标注、多次采样、多模型投票和真实 PR 反馈。
+
+## 主要参数
 
 ```text
---repo              要审查的本地仓库路径
---base              对比基线，例如 HEAD~1 或 main
---target            目标版本，例如 HEAD 或 feature branch
---pr-description    PR 描述文件，可选
---test-command      测试命令，可选，例如 "python -m pytest"
---language          报告语言：zh 或 en
---mode              执行模式：council 或 simple
---critic-pass       是否启用 critic review：true 或 false
---llm-provider      LLM provider：aliyun 或 none
---llm-model         DashScope 模型名，默认 qwen-turbo-latest
---llm-base-url      OpenAI-compatible DashScope base URL
+--repo                 仓库路径，默认当前目录
+--base                 对比基线，例如 HEAD~1、main 或某个 commit
+--target               对比目标，例如 HEAD、feature branch 或某个 commit
+--pr-description       PR 描述文件，可为空
+--language             输出语言，zh 或 en
+--mode                 debate、council、agentic 或 simple，默认 debate
+--debate-max-actions   Debate loop 最大 action 数，默认 12
+--critic-pass          是否执行 critic review，默认 true
+--test-command         允许 agent 调用的测试命令；未传入时 run_tests 会受控拒绝
+--llm-provider         aliyun 或 none
+--llm-model            Review 使用的 DashScope 模型，默认 qwen-turbo-latest
+--llm-base-url         OpenAI-compatible DashScope base URL
+--judge-report         对指定 judge_input.json 运行 AI Judge
+--judge-model          Judge 使用的 DashScope 模型，默认 qwen-plus
 ```
 
-## 输出结果
+## 输出文件
 
 ```text
-.review-agent/report.md        # 面向人阅读的审查报告
-.review-agent/findings.json    # 结构化 findings，可用于 CI 或平台集成
-.review-agent/transcript.jsonl # Agent 运行轨迹：工具、LLM、消息、证据、生命周期
+.review-agent/report.md              # 标准化 Markdown 审查报告
+.review-agent/findings.json          # 结构化 findings 和生命周期信息
+.review-agent/judge_input.json       # 给 AI Judge 使用的标准化输入
+.review-agent/transcript.jsonl       # Review 过程 trace
+.review-agent/judge.json             # AI Judge JSON 评分
+.review-agent/judge.md               # AI Judge Markdown 评分报告
+.review-agent/judge-transcript.jsonl # Judge 调用 trace
 ```
 
-最终 verdict 根据 accepted findings 生成：
+## Debate 与 Council 的区别
+
+| 维度 | `--mode council` | `--mode debate` |
+|---|---|---|
+| 定位 | 旧版固定 workflow baseline | 当前默认多 Agent debate 模式 |
+| Reviewer 分工 | Security / Correctness / Test / Maintainability | 保留同样 reviewer 分工 |
+| 控制方式 | 程序固定执行 reviewer -> critic -> lead -> report | Lead Debate Controller 动态选择 action |
+| Finding 质量控制 | 一轮 critic + 一轮 lead resolution | 多轮质疑、补证、反驳、合并、接受、拒绝 |
+| 重复项处理 | 容易出现多个 reviewer 报同一问题 | 支持 `merge_duplicates` |
+| 报告 | 标准化输出 | 标准化输出，并可由 ReportWriterAgent 进一步整理 |
+| 适合用途 | baseline 对照、教学解释 | 默认推荐、项目展示、效果评估 |
+
+核心思想：PR review 不应该用“发现问题数量”作为主要指标。更合理的指标是关键风险覆盖、证据质量、严重级别准确性、重复/噪音控制、修复建议可执行性和报告清晰度。
+
+## Demo 审查质量对比
+
+以下结果来自内置 `payment_risk.py` demo，在相同 diff 和 PR 描述下分别运行 `--mode council` 与 `--mode debate`，再用相同的 `qwen-plus` AI Judge 对标准化 `judge_input.json` 评分。这个分数不是绝对真理，而是用于横向比较两种 agent 策略的 evaluation proxy。
+
+| 指标 | `council` | `debate` | 变化 |
+|---|---:|---:|---:|
+| AI Judge 总分 | 72 | 92 | +20 |
+| critical issue coverage | 100 | 100 | 持平 |
+| evidence quality | 85 | 95 | +10 |
+| severity accuracy | 70 | 90 | +20 |
+| duplicate/noise control | 40 | 98 | +58 |
+| actionability | 90 | 96 | +6 |
+| report clarity | 80 | 85 | +5 |
+
+对比结果说明：新版 `debate` 并不是单纯追求更多 findings，而是通过 critic、补证、合并重复项和标准化报告，提升证据质量、严重级别判断和重复/噪音控制。
+
+示例输出已整理在 [docs/demo-results](docs/demo-results/README.md)，包含脱敏后的 council/debate 报告和 AI Judge 评分结果。
+
+## 项目结构
 
 ```text
-approve          没有需要处理的问题
-comment          只有 P2/P3 问题
-request_changes  存在 P0/P1 问题
+agents/review_agent.py              # 主实现：CLI、tools、LLM client、agent loop、report、judge
+skills/code-review/SKILL.md         # code review skill，注入审查规范和 finding schema
+docs/demo-pr.md                     # Demo PR 描述
+docs/demo-results/                  # 脱敏后的 demo 报告和 AI Judge 评分结果
+docs/中文教程-Agent简历面试.md       # 中文教程、简历写法、面试问答
+demo/pr-fixture/payment_risk.py     # Demo 风险代码
+tests/test_review_agent.py          # 单元测试与集成测试
+requirements.txt                    # 运行与测试依赖
+.env.example                        # 环境变量模板
 ```
 
-## 如何确认真的调用了 LLM
+## 和 learn-claude-code / Claude Code 思路的关系
 
-运行后查看 transcript：
+这个项目不是 Claude Code 本身，也没有复制 Claude Code 内部实现。它是基于 `learn-claude-code` 的学习思路做的 PR Review Agent 项目，借鉴并工程化了以下 Agent 技术：
 
-```powershell
-Select-String -Path .review-agent\transcript.jsonl -Pattern "llm.request","llm.response","llm.error","llm.skipped"
-```
+- **Tool Calling**：Agent 只能通过受控只读工具观察仓库，如 `git_diff`、`changed_files`、`read_file_context`、`search_code`、`secret_scan`、受控 `run_tests`。
+- **Skill Loading**：从 `skills/code-review/SKILL.md` 加载审查规范和 finding schema，注入到 reviewer、critic、lead、report writer 的 prompt。
+- **Multi-Agent System**：Security、Correctness、Test、Maintainability、Critic、Lead、ReportWriter、Judge 以不同角色协作。
+- **Debate Loop**：不是固定流程结束，而是围绕 finding 进行动态 action 选择。
+- **Todo / Lifecycle 思想**：通过 FindingLifecycle 管理 candidate、challenged、accepted、rejected、downgraded 状态。
+- **Structured Output**：review、debate action、report、judge 都要求 JSON 输出，程序负责校验与模板渲染。
+- **Observability**：用 JSONL transcript 记录每一步，便于调试、复盘和面试展示。
 
-完整的 LLM council run 通常会包含：
+## 简历写法示例
 
-```text
-lead-reviewer.plan
-security-reviewer
-correctness-reviewer
-test-reviewer
-maintainability-reviewer
-critic-reviewer
-lead-reviewer.resolve
-```
-
-如果看到 `llm.skipped`，通常说明没有配置 API key，或者运行时选择了 `--llm-provider none`。
-
-## Demo 场景
-
-`demo/pr-fixture/payment_risk.py` 模拟一个支付风控 PR，故意放入了多类需要审查的问题：
-
-- 硬编码 API token 和 webhook secret。
-- SQL 字符串拼接。
-- 不安全的 shell 执行。
-- trusted merchant 绕过风控。
-- 高风险国家处理逻辑过弱。
-- webhook 签名不匹配时仍然接受事件。
-- 内存态幂等记录，不适合生产环境。
-- 退款逻辑缺少原交易校验。
-- 敏感信息日志输出。
-- 可变默认参数和吞异常。
-- 缺少覆盖生产行为变化的测试。
-
-## 与 learn-claude-code 的关系
-
-本项目不是 Claude Code 的直接依赖，而是基于 `learn-claude-code` 的 Agent 学习思路做的二次改造和项目化实现。核心目标是把“Claude Code 风格的 Agent 工程能力”迁移到一个可以本地运行、可以调用 Qwen、可以用于简历展示的 PR Review Agent 系统中。
-
-对应关系包括：
-
-- Tool Calling：通过工具收集 Git diff、文件上下文、测试结果。
-- Skill：通过 `skills/code-review/SKILL.md` 注入代码审查规范。
-- Todo / Planning：Lead Reviewer 先制定多角色审查计划。
-- MAS：多个 Reviewer Agent 分工协作。
-- Agent Communication：MessageBus 记录 Agent 之间的任务、finding、challenge、resolution。
-- Transcript：使用 JSONL 记录完整执行轨迹，便于复盘和调试。
-
-## 技术关键词
-
-Python, Aliyun DashScope, Qwen, OpenAI-compatible Chat Completions, LLM Agent, Multi-Agent System, Tool Calling, Skill Loading, Todo Tracking, MessageBus, Agent Communication, EvidenceStore, FindingLifecycle, Critic Agent, Lead Agent Planning, Structured Output, JSON Schema Validation, JSONL Trace, Git Diff Analysis, pytest
-
-## 简历写法参考
-
-基于 Python 和阿里云 DashScope/Qwen 构建 LLM-first 多 Agent PR 审查系统，借鉴 learn-claude-code 的 Agent 工程模式，实现 Tool Calling、Skill Loading、MessageBus、EvidenceStore、FindingLifecycle、Critic Agent 和 JSONL Trace，使代码审查结果具备可解释、可追踪、可集成的工程能力。
+> 基于 Python、Aliyun DashScope/Qwen 构建 Debate Council PR Review Agent，参考 learn-claude-code 的 Agent 工程思想，设计 Security/Correctness/Test/Maintainability Reviewer、Critic、Lead Debate Controller、ReportWriterAgent 与 AI Judge 的多 Agent 协作机制；实现受控只读 Tool Calling、Skill Loading、FindingLifecycle、EvidenceStore、动态 Debate Loop、结构化 JSON 输出与 JSONL Transcript 可观测性；通过标准化 `judge_input.json` 和 qwen-plus Judge rubric 对 review quality 进行相对评估，关注 critical issue coverage、evidence quality、severity accuracy、duplicate/noise control 和 actionability。
