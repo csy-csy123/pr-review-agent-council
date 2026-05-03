@@ -19,14 +19,16 @@
 
 ## 功能概览
 
-- **默认 Debate 模式**：`--mode debate`，保留 council 的 reviewer 团队，但让 Lead Debate Controller 动态决定下一步 action。
-- **旧 Council 模式**：`--mode council`，固定流程 baseline，便于对比升级前后的效果。
-- **Agentic 模式**：`--mode agentic`，全局 ReAct 风格只读 agent loop，作为实验模式保留。
-- **Simple 模式**：`--mode simple`，本地规则兜底，不依赖 LLM。
-- **Critic Reviewer**：对候选 finding 提出挑战，检查证据、严重级别和误报风险。
-- **ReportWriterAgent**：必须走固定 JSON schema，Markdown 由程序模板渲染，减少文笔差异对评估的影响。
-- **AI Judge**：独立命令触发，默认 `qwen-plus`，读取 `judge_input.json`，按固定 rubric 评分。
-- **Transcript Observability**：所有 action、observation、message、evidence、resolution 都写入 JSONL trace。
+- **Debate Council 默认审查模式**：以 `--mode debate` 运行，多名 reviewer 先提出候选 finding，再由 Lead Debate Controller 动态决定质疑、补证、反驳、合并、接受或拒绝。
+- **多 Agent 分工协作**：内置 Security、Correctness、Test、Maintainability、Critic、Lead、ReportWriter、Judge 等角色，把 PR Review 拆成覆盖、质检、裁决和评估多个阶段。
+- **动态 Debate Loop**：不同于固定 workflow，系统会围绕每个 finding 的证据质量和误报风险进行多轮处理，重点提升有效问题质量，而不是单纯增加问题数量。
+- **只读 Tool Calling**：通过 `git_diff`、`changed_files`、`read_file_context`、`search_code`、`secret_scan`、受控 `run_tests` 等工具观察仓库，避免 Agent 凭空猜测。
+- **Skill Loading**：从 `skills/code-review/SKILL.md` 加载审查规范、严重级别定义和 finding schema，并注入 reviewer、critic、lead、report writer 的 prompt。
+- **FindingLifecycle + EvidenceStore**：记录 candidate、challenged、accepted、rejected、downgraded 等状态，并为每个 finding 绑定 diff 行、文件上下文、critic notes 和裁决理由。
+- **标准化 ReportWriterAgent**：LLM 只能输出固定 JSON schema，Markdown 由程序模板渲染，减少文笔差异对报告质量和 AI Judge 评分的影响。
+- **AI Judge 质量评估**：独立命令触发，默认使用 `qwen-plus`，按 critical issue coverage、evidence quality、severity accuracy、duplicate/noise control、actionability、report clarity 等维度评分。
+- **可观测 Transcript**：所有 action、observation、message、evidence、resolution 都写入 JSONL trace，便于复盘、调试和面试展示。
+- **Council Baseline 保留**：`--mode council` 作为旧版固定流程 baseline，方便复现新旧模式对比。
 
 ## 新旧模式流程图
 
@@ -161,7 +163,7 @@ DASHSCOPE_API_KEY=your_dashscope_api_key
 python -m pytest -p no:cacheprovider
 ```
 
-当前测试覆盖 debate loop、agentic loop、工具调用、report writer、AI Judge fallback、council/simple 兼容逻辑等。
+当前测试覆盖 debate loop、工具调用、report writer、AI Judge fallback、council/simple 兼容逻辑等。
 
 项目运行代码主要使用 Python 标准库；`requirements.txt` 中的 `pytest` 用于复现测试和验证。
 
@@ -186,14 +188,6 @@ python agents/review_agent.py --repo . --base HEAD~1 --target HEAD --pr-descript
 ```
 
 这个模式保留固定流程：多个 reviewer 先审查，critic 再质疑，lead reviewer 再裁决。它适合作为 baseline，用来解释为什么后来升级为 debate loop。
-
-### 全局 ReAct 实验模式：Agentic
-
-```bash
-python agents/review_agent.py --repo . --base HEAD~1 --target HEAD --pr-description docs/demo-pr.md --language zh --mode agentic
-```
-
-这个模式让主 Agent 动态选择工具和下一步动作，更接近通用 ReAct agent，但在 PR review 场景下，默认推荐使用 `debate`，因为它保留了 reviewer 分工覆盖，同时把最关键的 finding 质量控制做成动态 loop。
 
 ### 本地兜底：Simple
 
@@ -245,7 +239,7 @@ AI Judge 不是 ground truth。它的定位是一个自动化 evaluation proxy�
 --target               对比目标，例如 HEAD、feature branch 或某个 commit
 --pr-description       PR 描述文件，可为空
 --language             输出语言，zh 或 en
---mode                 debate、council、agentic 或 simple，默认 debate
+--mode                 debate、council 或 simple，默认 debate
 --debate-max-actions   Debate loop 最大 action 数，默认 12
 --critic-pass          是否执行 critic review，默认 true
 --test-command         允许 agent 调用的测试命令；未传入时 run_tests 会受控拒绝
@@ -328,4 +322,16 @@ requirements.txt                    # 运行与测试依赖
 
 ## 简历写法示例
 
-> 基于 Python、Aliyun DashScope/Qwen 构建 Debate Council PR Review Agent，参考 learn-claude-code 的 Agent 工程思想，设计 Security/Correctness/Test/Maintainability Reviewer、Critic、Lead Debate Controller、ReportWriterAgent 与 AI Judge 的多 Agent 协作机制；实现受控只读 Tool Calling、Skill Loading、FindingLifecycle、EvidenceStore、动态 Debate Loop、结构化 JSON 输出与 JSONL Transcript 可观测性；通过标准化 `judge_input.json` 和 qwen-plus Judge rubric 对 review quality 进行相对评估，关注 critical issue coverage、evidence quality、severity accuracy、duplicate/noise control 和 actionability。
+可以根据简历篇幅选择下面任意一种写法：
+
+**偏工程落地版**
+
+> 基于 Python、Aliyun DashScope/Qwen 实现 Debate Council PR Review Agent，构建 Security/Correctness/Test/Maintainability Reviewer、Critic、Lead Debate Controller、ReportWriterAgent 与 AI Judge 的多 Agent 协作审查链路；通过只读 Tool Calling 获取 Git diff、变更文件、代码上下文、关键词检索和密钥扫描结果，并用 EvidenceStore 与 FindingLifecycle 管理候选问题、质疑、补证、合并、接受、拒绝和降级流程。
+
+**偏 Agent 技术版**
+
+> 参考 learn-claude-code 的 Agent 工程思想，设计面向 PR Review 的 Debate Loop：Lead Controller 基于 finding 状态动态选择 `ask_critic`、`request_reviewer_defense`、`request_more_evidence`、`merge_duplicates`、`accept_finding`、`reject_finding` 等 action；结合 Skill Loading、结构化 JSON 输出、受控工具调用和 JSONL Transcript，实现可追踪、可降级、可复现的多 Agent 代码审查系统。
+
+**偏效果评估版**
+
+> 设计标准化 ReportWriterAgent 与 AI Judge 评估链路：ReportWriterAgent 仅输出固定 JSON schema，由程序模板渲染 Markdown，降低文笔对评估的影响；AI Judge 基于 `judge_input.json` 和固定 rubric 从 critical issue coverage、evidence quality、severity accuracy、duplicate/noise control、actionability、report clarity 等维度对 review quality 做相对评分，用于比较 debate 模式与 council baseline 的审查质量。
