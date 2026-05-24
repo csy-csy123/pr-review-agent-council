@@ -35,31 +35,38 @@
 ```mermaid
 flowchart TD
     A["输入<br/>repo + base/target + PR 描述"] --> B["ReviewAgent"]
-    B --> C["ReviewTools<br/>读取 diff / changed files / file context"]
+    B --> C["ReviewTools<br/>diff / context / risk_scan / retrieve_company_policy"]
     B --> D["SkillLoader<br/>加载 code-review skill"]
+    B --> D2["CompanyKnowledgeBase<br/>company Markdown -> chunks -> index"]
     B --> E["LLM Client<br/>Qwen / fallback"]
 
     C --> F["ReviewCouncil<br/>固定编排"]
     D --> F
+    D2 --> F
     E --> F
 
-    F --> G["Lead Reviewer<br/>生成 review focus"]
+    D2 --> G2["company_knowledge<br/>context injection"]
+    G2 --> G["Lead Reviewer<br/>生成 review focus"]
+    F --> G
     G --> H["Security Reviewer"]
     G --> I["Correctness Reviewer"]
     G --> J["Test Reviewer"]
     G --> K["Maintainability Reviewer"]
+    G --> K2["Company Policy Reviewer<br/>risk_scan + policy retrieval"]
 
     H --> L["Candidate Findings"]
     I --> L
     J --> L
     K --> L
+    K2 --> L
 
-    L --> M["EvidenceStore<br/>绑定 diff line 和上下文"]
+    L --> L2["Finding-level RAG<br/>attach matched company policies"]
+    L2 --> M["EvidenceStore<br/>diff context + company_policy evidence"]
     M --> N["Critic Reviewer<br/>一轮质疑"]
     N --> O["Lead Reviewer<br/>一轮裁决"]
     O --> P["Accepted / Rejected / Downgraded"]
     P --> Q["ReportWriter"]
-    Q --> R["report.md / findings.json / transcript.jsonl"]
+    Q --> R["report.md / findings.json / judge_input.json<br/>policy_references + transcript.jsonl"]
 ```
 
 当前默认 `--mode debate` 保留 reviewer 团队，但把 finding 质量控制升级为动态 debate loop：
@@ -68,17 +75,24 @@ flowchart TD
 flowchart TD
     A["输入<br/>repo + base/target + PR 描述"] --> B["ReviewAgent"]
     B --> C["SkillLoader<br/>加载 code-review skill"]
-    B --> D["ReviewTools<br/>git_diff / changed_files / read_file_context / search_code / secret_scan"]
+    B --> D["ReviewTools<br/>git_diff / changed_files / read_file_context / search_code / risk_scan / retrieve_company_policy"]
+    B --> D2["CompanyKnowledgeBase<br/>Markdown chunks + DashScope embeddings"]
     B --> E["AliyunDashScopeClient<br/>Qwen / DashScope"]
 
     C --> F["skill_context"]
+    D2 --> F2["company_knowledge context"]
+    D2 --> F3["embedding_hybrid<br/>or keyword_fallback"]
     D --> G["DebateCouncilLoop<br/>默认模式"]
     E --> G
     F --> G
+    F2 --> G
 
     G --> H["Specialist Reviewers<br/>Security / Correctness / Test / Maintainability"]
+    F3 --> H2["Company Policy Reviewer<br/>RAG as reviewer"]
     H --> I["Candidate Findings"]
-    I --> J["EvidenceStore<br/>diff line + file context + critic notes"]
+    H2 --> I
+    I --> I2["Finding-level policy retrieval<br/>title + evidence + impact + suggestion"]
+    I2 --> J["EvidenceStore<br/>diff context + company_policy + critic notes"]
     I --> K["FindingLifecycle<br/>candidate / challenged / accepted / rejected / downgraded"]
 
     K --> L["Lead Debate Controller<br/>动态选择下一步 action"]
@@ -105,7 +119,7 @@ flowchart TD
     Q --> R["Template Renderer<br/>标准化 Markdown"]
     R --> S["report.md"]
     R --> T["findings.json"]
-    R --> U["judge_input.json"]
+    R --> U["judge_input.json<br/>policy_references"]
 
     U --> V["AI Judge<br/>qwen-plus，一次性评估"]
     V --> W["judge.json / judge.md"]
@@ -333,6 +347,67 @@ requirements.txt                    # 运行与测试依赖
 **偏效果评估版**
 
 > 设计标准化 ReportWriterAgent 与 AI Judge 评估链路：ReportWriterAgent 仅输出固定 JSON schema，由程序模板渲染 Markdown，降低文笔对评估的影响；AI Judge 基于 `judge_input.json` 和固定 rubric 从 critical issue coverage、evidence quality、severity accuracy、duplicate/noise control、actionability、report clarity 等维度对 review quality 做相对评分，用于比较 debate 模式与 council baseline 的审查质量。
+
+## Company Knowledge RAG
+
+新版本新增 **公司知识对齐 RAG**，用于把通用 PR review 能力对齐到特定公司的编码规范、安全基线、支付规范、测试要求和历史缺陷案例。
+
+默认知识库位于：
+
+```text
+knowledge/company/
+  security_baseline.md
+  payment_review_policy.md
+  testing_policy.md
+  incident_cases.md
+```
+
+RAG 现在接在三层：
+
+- **上下文层**：review 开始前检索相关公司规范，注入 `<company_knowledge>`。
+- **证据层**：每个 candidate finding 生成后检索相关规范，写入 `EvidenceStore`，source 为 `company_policy`。
+- **发现层**：新增 `company-policy-reviewer`，基于 `risk_scan + retrieve_company_policy` 主动发现公司规范违规。
+
+```mermaid
+flowchart TD
+    A["PR 输入<br/>diff + changed files + description"] --> B["ReviewAgent"]
+    B --> C["SkillLoader<br/>code-review skill"]
+    B --> D["CompanyKnowledgeBase<br/>Markdown chunks + DashScope embeddings"]
+    B --> E["ReviewTools<br/>risk_scan / retrieve_company_policy"]
+
+    D --> F["Company Knowledge RAG<br/>embedding_hybrid / keyword_fallback"]
+    F --> G["company_knowledge context"]
+    C --> H["Specialist Reviewers"]
+    G --> H
+
+    H --> I["Candidate Findings"]
+    I --> J["Finding-level policy retrieval"]
+    J --> K["EvidenceStore<br/>company_policy evidence"]
+
+    E --> L["CompanyPolicyReviewer<br/>RAG as reviewer"]
+    L --> I
+
+    K --> M["Critic + Lead Debate Controller"]
+    M --> N["ReportWriterAgent"]
+    N --> O["policy_references<br/>report.md / judge_input.json"]
+```
+
+常用命令：
+
+```bash
+# 默认启用公司知识 RAG
+python agents/review_agent.py --repo . --base HEAD~1 --target HEAD --pr-description docs/demo-pr.md --language zh --mode debate
+
+# 指定知识库目录
+python agents/review_agent.py --repo . --base HEAD~1 --target HEAD --company-knowledge-dir knowledge/company
+
+# 关闭 RAG 做对比实验
+python agents/review_agent.py --repo . --base HEAD~1 --target HEAD --disable-company-rag
+```
+
+有 `DASHSCOPE_API_KEY` 时使用 DashScope OpenAI-compatible embeddings，默认模型 `text-embedding-v4`、维度 `1024`；无 key 或请求失败时自动退化到 `keyword_fallback`，不会阻塞本地 demo。
+
+详细设计见 [docs/company-rag.md](docs/company-rag.md)，demo 快照见 [docs/demo-results/company-rag-report.md](docs/demo-results/company-rag-report.md)，简历与面试包装见 [docs/resume-company-rag-update.md](docs/resume-company-rag-update.md)。
 
 ## Star History
 

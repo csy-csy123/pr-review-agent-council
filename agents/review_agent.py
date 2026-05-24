@@ -12,7 +12,9 @@ to an append-only transcript for observability.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import math
 import os
 import re
 import subprocess
@@ -33,9 +35,11 @@ JUDGE_INPUT_NAME = "judge_input.json"
 JUDGE_NAME = "judge.json"
 JUDGE_REPORT_NAME = "judge.md"
 JUDGE_TRANSCRIPT_NAME = "judge-transcript.jsonl"
+COMPANY_KNOWLEDGE_INDEX_NAME = "company_knowledge_index.json"
 MAX_DIFF_CHARS = 120000
 MAX_CMD_OUTPUT = 50000
 MAX_SKILL_CHARS = 12000
+MAX_COMPANY_CONTEXT_CHARS = 6000
 
 SEVERITIES = {"P0", "P1", "P2", "P3"}
 CATEGORIES = {"security", "correctness", "performance", "testing", "maintainability"}
@@ -110,6 +114,19 @@ TOOLS = [
         "name": "risk_scan",
         "description": "Extract review-worthy risk signals from added diff lines for the LLM to judge.",
         "input_schema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "retrieve_company_policy",
+        "description": "Retrieve company-specific coding, security, payment, and testing policies relevant to a review question.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+                "category": {"type": "string"},
+                "max_results": {"type": "integer"},
+            },
+            "required": ["query"],
+        },
     },
     {
         "name": "emit_finding",
@@ -686,12 +703,327 @@ class SkillLoader:
         return f"<skill name=\"{name}\">\n{data['body']}\n</skill>"
 
 
+@dataclass(frozen=True)
+class CompanyKnowledgeChunk:
+    policy_id: str
+    doc_path: str
+    heading: str
+    text: str
+    category: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+class CompanyKnowledgeBase:
+    def __init__(
+        self,
+        knowledge_dir: Path,
+        index_path: Path,
+        transcript: Transcript,
+        api_key: str | None = None,
+        base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        embedding_model: str = "text-embedding-v4",
+        embedding_dimensions: int = 1024,
+        enabled: bool = True,
+        timeout: int = 20,
+    ):
+        self.knowledge_dir = knowledge_dir.resolve()
+        self.index_path = index_path
+        self.transcript = transcript
+        self.api_key = api_key or ""
+        self.base_url = base_url.rstrip("/")
+        self.embedding_model = embedding_model
+        self.embedding_dimensions = int(embedding_dimensions or 1024)
+        self.enabled = enabled
+        self.timeout = timeout
+        self._chunks: list[CompanyKnowledgeChunk] | None = None
+        self._embeddings: list[list[float] | None] | None = None
+        self._embeddings_fingerprint = ""
+        self._embedding_failed = False
+
+    def available(self) -> bool:
+        return self.enabled and self.knowledge_dir.exists()
+
+    def search(self, query: str, category: str | None = None, max_results: int = 3) -> list[dict[str, Any]]:
+        query = query.strip()
+        if not self.available() or not query:
+            return []
+        max_results = max(1, min(int(max_results or 3), 10))
+        chunks = self._load_chunks()
+        if category:
+            category = category.strip().lower()
+            filtered = [chunk for chunk in chunks if category in {chunk.category.lower(), "all"}]
+            if filtered:
+                chunks = filtered
+        if not chunks:
+            return []
+
+        query_tokens = self._tokens(query)
+        keyword_scores = [self._keyword_score(query_tokens, query, chunk) for chunk in chunks]
+        query_embedding = self._embed_query(query)
+        embeddings = self._load_embeddings(chunks) if query_embedding is not None else []
+        results: list[dict[str, Any]] = []
+        for idx, chunk in enumerate(chunks):
+            method = "keyword_fallback"
+            score = keyword_scores[idx]
+            if query_embedding is not None and idx < len(embeddings) and embeddings[idx]:
+                cosine = self._cosine(query_embedding, embeddings[idx] or [])
+                score = (cosine * 0.85) + (min(keyword_scores[idx], 1.0) * 0.15)
+                method = "embedding_hybrid"
+            if score <= 0:
+                continue
+            results.append(self._result(chunk, score, method))
+
+        results.sort(key=lambda item: item["score"], reverse=True)
+        selected = results[:max_results]
+        self.transcript.emit(
+            "company_rag.search",
+            query=truncate(query, 300),
+            category=category or "",
+            count=len(selected),
+            method=selected[0]["retrieval_method"] if selected else "none",
+        )
+        return selected
+
+    def context_block(self, query: str, max_results: int = 5) -> str:
+        results = self.search(query, max_results=max_results)
+        if not results:
+            return ""
+        lines = ["<company_knowledge>", "Use these company policies as review standards when relevant."]
+        for item in results:
+            lines.extend(
+                [
+                    f"- policy_id: {item['policy_id']}",
+                    f"  source: {item['doc_path']}#{item['heading']}",
+                    f"  retrieval: {item['retrieval_method']} score={item['score']}",
+                    f"  excerpt: {item['excerpt']}",
+                ]
+            )
+        lines.append("</company_knowledge>")
+        return truncate("\n".join(lines), MAX_COMPANY_CONTEXT_CHARS)
+
+    def _load_chunks(self) -> list[CompanyKnowledgeChunk]:
+        if self._chunks is not None:
+            return self._chunks
+        self._chunks = self._read_markdown_chunks()
+        self.transcript.emit("company_rag.load", dir=str(self.knowledge_dir), chunks=len(self._chunks))
+        return self._chunks
+
+    def _read_markdown_chunks(self) -> list[CompanyKnowledgeChunk]:
+        if not self.knowledge_dir.exists():
+            self.transcript.emit("company_rag.missing", dir=str(self.knowledge_dir))
+            return []
+        chunks: list[CompanyKnowledgeChunk] = []
+        for path in sorted(self.knowledge_dir.rglob("*.md")):
+            rel = path.relative_to(self.knowledge_dir).as_posix()
+            category = path.stem.replace("_", "-")
+            text = path.read_text(encoding="utf-8", errors="replace")
+            current_heading = path.stem.replace("_", " ").title()
+            current_lines: list[str] = []
+
+            def flush() -> None:
+                body = "\n".join(line.strip() for line in current_lines).strip()
+                if not body:
+                    return
+                chunks.append(
+                    CompanyKnowledgeChunk(
+                        policy_id=self._policy_id(rel, current_heading),
+                        doc_path=rel,
+                        heading=current_heading,
+                        text=truncate(body, 1800),
+                        category=category,
+                    )
+                )
+
+            for raw in text.splitlines():
+                if raw.startswith("#"):
+                    flush()
+                    current_heading = raw.lstrip("#").strip() or current_heading
+                    current_lines = []
+                else:
+                    current_lines.append(raw)
+            flush()
+        return chunks
+
+    def _load_embeddings(self, chunks: list[CompanyKnowledgeChunk]) -> list[list[float] | None]:
+        fingerprint = self._fingerprint(chunks)
+        if self._embeddings is not None and self._embeddings_fingerprint == fingerprint:
+            return self._embeddings
+        cached = self._read_index_cache(chunks)
+        if cached is not None:
+            self._embeddings = cached
+            self._embeddings_fingerprint = fingerprint
+            return cached
+        if not self.api_key or self._embedding_failed:
+            self.transcript.emit("company_rag.embedding_disabled", reason="DASHSCOPE_API_KEY is not set")
+            self._embeddings = [None for _ in chunks]
+            self._embeddings_fingerprint = fingerprint
+            return self._embeddings
+        vectors = self._embed_texts([self._embedding_text(chunk) for chunk in chunks])
+        if vectors is None:
+            self._embedding_failed = True
+            self._embeddings = [None for _ in chunks]
+            self._embeddings_fingerprint = fingerprint
+            return self._embeddings
+        self._embeddings = vectors
+        self._embeddings_fingerprint = fingerprint
+        self._write_index_cache(chunks, vectors)
+        return vectors
+
+    def _embed_query(self, query: str) -> list[float] | None:
+        if not self.api_key or self._embedding_failed:
+            if not self.api_key:
+                self.transcript.emit("company_rag.embedding_disabled", reason="DASHSCOPE_API_KEY is not set")
+            return None
+        vectors = self._embed_texts([query])
+        if not vectors or vectors[0] is None:
+            self._embedding_failed = True
+            return None
+        return vectors[0]
+
+    def _embed_texts(self, texts: list[str]) -> list[list[float]] | None:
+        payload: dict[str, Any] = {
+            "model": self.embedding_model,
+            "input": texts,
+            "dimensions": self.embedding_dimensions,
+        }
+        endpoint = f"{self.base_url}/embeddings"
+        request = urllib.request.Request(
+            endpoint,
+            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        self.transcript.emit(
+            "company_rag.embedding.request",
+            model=self.embedding_model,
+            dimensions=self.embedding_dimensions,
+            count=len(texts),
+            endpoint=endpoint,
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                raw = response.read().decode("utf-8", errors="replace")
+            data = json.loads(raw)
+            vectors = [item["embedding"] for item in sorted(data["data"], key=lambda item: item.get("index", 0))]
+            if len(vectors) != len(texts):
+                raise ValueError("embedding count mismatch")
+            self.transcript.emit("company_rag.embedding.response", count=len(vectors))
+            return [[float(value) for value in vector] for vector in vectors]
+        except (urllib.error.URLError, TimeoutError, OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
+            self.transcript.emit("company_rag.embedding.error", error=str(exc))
+            return None
+
+    def _read_index_cache(self, chunks: list[CompanyKnowledgeChunk]) -> list[list[float] | None] | None:
+        try:
+            payload = json.loads(self.index_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        if payload.get("fingerprint") != self._fingerprint(chunks):
+            return None
+        if payload.get("model") != self.embedding_model:
+            return None
+        if int(payload.get("dimensions", 0) or 0) != self.embedding_dimensions:
+            return None
+        vectors = payload.get("embeddings")
+        if not isinstance(vectors, list) or len(vectors) != len(chunks):
+            return None
+        self.transcript.emit("company_rag.index_cache.hit", chunks=len(chunks))
+        return vectors
+
+    def _write_index_cache(self, chunks: list[CompanyKnowledgeChunk], vectors: list[list[float]]) -> None:
+        self.index_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "fingerprint": self._fingerprint(chunks),
+            "model": self.embedding_model,
+            "dimensions": self.embedding_dimensions,
+            "chunks": [chunk.to_dict() for chunk in chunks],
+            "embeddings": vectors,
+        }
+        self.index_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        self.transcript.emit("company_rag.index_cache.write", chunks=len(chunks))
+
+    def _fingerprint(self, chunks: list[CompanyKnowledgeChunk]) -> str:
+        digest = hashlib.sha256()
+        for chunk in chunks:
+            digest.update(json.dumps(chunk.to_dict(), sort_keys=True, ensure_ascii=False).encode("utf-8"))
+        return digest.hexdigest()
+
+    def _policy_id(self, rel: str, heading: str) -> str:
+        slug = re.sub(r"[^a-z0-9]+", "-", heading.lower()).strip("-") or "policy"
+        return f"{Path(rel).stem}:{slug}"
+
+    def _embedding_text(self, chunk: CompanyKnowledgeChunk) -> str:
+        return f"{chunk.doc_path}\n{chunk.heading}\n{chunk.text}"
+
+    def _result(self, chunk: CompanyKnowledgeChunk, score: float, method: str) -> dict[str, Any]:
+        excerpt = " ".join(chunk.text.split())
+        return {
+            "policy_id": chunk.policy_id,
+            "doc_path": chunk.doc_path,
+            "heading": chunk.heading,
+            "excerpt": truncate(excerpt, 700),
+            "score": round(float(score), 4),
+            "retrieval_method": method,
+        }
+
+    def _tokens(self, text: str) -> set[str]:
+        tokens = {token.lower() for token in re.findall(r"[A-Za-z0-9_./-]{2,}", text)}
+        aliases = {
+            "webhook": {"signature", "callback", "replay", "idempotency"},
+            "signature": {"webhook", "hmac", "reject"},
+            "token": {"secret", "credential", "log"},
+            "card": {"pan", "sensitive", "log"},
+            "sql": {"parameterized", "injection", "query"},
+            "shell": {"subprocess", "command", "execution"},
+            "test": {"coverage", "regression"},
+        }
+        expanded = set(tokens)
+        for token in tokens:
+            expanded.update(aliases.get(token, set()))
+        return expanded
+
+    def _keyword_score(self, query_tokens: set[str], query: str, chunk: CompanyKnowledgeChunk) -> float:
+        haystack = f"{chunk.doc_path} {chunk.heading} {chunk.text}".lower()
+        if not query_tokens:
+            return 0.0
+        overlap = sum(1 for token in query_tokens if token in haystack)
+        score = overlap / max(len(query_tokens), 1)
+        query_lower = query.lower()
+        for phrase in ("webhook signature", "sensitive log", "sql injection", "shell true", "command execution"):
+            if phrase in query_lower and all(part in haystack for part in phrase.split()):
+                score += 0.35
+        return score
+
+    def _cosine(self, left: list[float], right: list[float]) -> float:
+        if not left or not right or len(left) != len(right):
+            return 0.0
+        dot = sum(a * b for a, b in zip(left, right))
+        left_norm = math.sqrt(sum(a * a for a in left))
+        right_norm = math.sqrt(sum(b * b for b in right))
+        if left_norm == 0 or right_norm == 0:
+            return 0.0
+        return dot / (left_norm * right_norm)
+
+
 class ReviewTools:
-    def __init__(self, repo: Path, base: str, target: str, transcript: Transcript):
+    def __init__(
+        self,
+        repo: Path,
+        base: str,
+        target: str,
+        transcript: Transcript,
+        company_kb: CompanyKnowledgeBase | None = None,
+    ):
         self.repo = repo.resolve()
         self.base = base
         self.target = target
         self.transcript = transcript
+        self.company_kb = company_kb
         self._diff_cache: str | None = None
         self._files_cache: list[dict[str, Any]] | None = None
 
@@ -804,6 +1136,19 @@ class ReviewTools:
         self.transcript.emit("tool.search_code", query=query, path=path or ".", count=len(matches))
         return matches
 
+    def retrieve_company_policy(
+        self,
+        query: str,
+        category: str | None = None,
+        max_results: int = 3,
+    ) -> list[dict[str, Any]]:
+        if not self.company_kb:
+            self.transcript.emit("tool.retrieve_company_policy.disabled", reason="company RAG is disabled")
+            return []
+        results = self.company_kb.search(query, category=category, max_results=max_results)
+        self.transcript.emit("tool.retrieve_company_policy", count=len(results), category=category or "")
+        return results
+
     def risk_scan(self) -> list[dict[str, Any]]:
         diff = self.git_diff()
         signals: list[dict[str, Any]] = []
@@ -858,7 +1203,9 @@ class ReviewTools:
                     "swallowed_exception",
                     "The new code swallows exceptions and can fail open or hide data failures.",
                 )
-            if re.search(r"\b(print|logging\.\w+)\(.*(token|secret|signature|card|password)", lowered):
+            if re.search(r"\b(print|logging\.\w+)\(.*(token|secret|signature|card|password)", lowered) and (
+                "{" in stripped or "=" in stripped
+            ):
                 add(line, "security", "sensitive_logging", "Sensitive values appear in logs or print output.")
             if "signature !=" in stripped and file_path in added_by_file:
                 next_lines = [
@@ -866,7 +1213,8 @@ class ReviewTools:
                     for item in added_by_file[file_path]
                     if line["line"] < item["line"] <= line["line"] + 3
                 ]
-                if not any(text.startswith(("return", "raise")) for text in next_lines):
+                rejects = ("reject", "unauthorized", "forbidden", "invalid", "401", "403", "raise")
+                if not any(text.startswith("raise") or (text.startswith("return") and any(token in text for token in rejects)) for text in next_lines):
                     add(line, "security", "signature_mismatch_not_rejected", "Signature mismatch is observed but not rejected.")
             if "startswith(\"test-\")" in stripped or "startswith('test-')" in stripped:
                 add(line, "correctness", "trust_bypass_pattern", "A test-prefix shortcut can accidentally trust production input.")
@@ -932,6 +1280,8 @@ class SpecialtyReviewers:
             count = self.testing(files, test_result)
         elif name == "maintainability-reviewer":
             count = self.maintainability(diff, files)
+        elif name == "company-policy-reviewer":
+            count = self.company_policy()
         else:
             raise ValueError(f"Unknown reviewer: {name}")
         self.transcript.emit("subagent.complete", name=name, findings=count)
@@ -1100,6 +1450,78 @@ class SpecialtyReviewers:
                     evidence=truncate(str(test_result.get("output", "")), 1000),
                     impact="A failing test suite means the branch is not safe to merge.",
                     suggestion="Fix the failing tests or update the implementation if the failures expose a regression.",
+                )
+            )
+        return len(self.collector.findings) - before
+
+    def company_policy(self) -> int:
+        before = len(self.collector.findings)
+        policy_map = {
+            "sql_interpolation": {
+                "severity": "P1",
+                "category": "security",
+                "title": "Company policy requires parameterized SQL",
+                "impact": "This violates the company SQL baseline and can expose payment data through injection.",
+                "suggestion": "Use database-driver parameter binding and add a malicious identifier regression test.",
+            },
+            "shell_execution": {
+                "severity": "P1",
+                "category": "security",
+                "title": "Company policy blocks shell execution with request input",
+                "impact": "This violates the command execution baseline for request paths and can become command injection.",
+                "suggestion": "Use an argument list with shell=False and validate every argument.",
+            },
+            "sensitive_logging": {
+                "severity": "P1",
+                "category": "security",
+                "title": "Company policy forbids logging payment secrets",
+                "impact": "This violates sensitive logging rules and can leak credentials or card data into log systems.",
+                "suggestion": "Remove the sensitive fields or use masked logging helpers.",
+            },
+            "signature_mismatch_not_rejected": {
+                "severity": "P1",
+                "category": "security",
+                "title": "Company policy requires webhook signature failures to reject",
+                "impact": "This violates payment webhook policy and can accept forged or replayed payment callbacks.",
+                "suggestion": "Reject invalid signatures before any state mutation and use constant-time comparison.",
+            },
+            "swallowed_exception": {
+                "severity": "P2",
+                "category": "correctness",
+                "title": "Company policy requires risk controls to fail closed",
+                "impact": "This violates payment risk policy because failures can disappear and default to unsafe behavior.",
+                "suggestion": "Handle specific exceptions and return a conservative manual review decision.",
+            },
+            "no_tests_changed": {
+                "severity": "P2",
+                "category": "testing",
+                "title": "Company policy requires tests for payment-sensitive changes",
+                "impact": "This violates testing policy for payment, security, or risk-control changes.",
+                "suggestion": "Add targeted tests for the changed payment behavior and failure paths.",
+            },
+        }
+        for signal in self.tools.risk_scan():
+            spec = policy_map.get(signal.get("signal"))
+            if not spec:
+                continue
+            policies = self.tools.retrieve_company_policy(
+                " ".join([str(signal.get("signal", "")), str(signal.get("evidence", "")), str(signal.get("rationale", ""))]),
+                category=str(spec["category"]),
+                max_results=2,
+            )
+            if not policies:
+                continue
+            policy_text = "; ".join(policy["policy_id"] for policy in policies)
+            self.collector.emit(
+                Finding(
+                    file=str(signal["file"]),
+                    line=int(signal["line"]),
+                    severity=str(spec["severity"]),
+                    category=str(spec["category"]),
+                    title=str(spec["title"]),
+                    evidence=f"{signal['evidence']} | company policy: {policy_text}",
+                    impact=str(spec["impact"]),
+                    suggestion=str(spec["suggestion"]),
                 )
             )
         return len(self.collector.findings) - before
@@ -1309,7 +1731,7 @@ class AliyunDashScopeClient(LLMClient):
         prompt = "\n".join(
             [
                 "Create a concise review plan for a multi-agent PR review council.",
-                "Allowed reviewers: security-reviewer, correctness-reviewer, test-reviewer, maintainability-reviewer.",
+                "Allowed reviewers: security-reviewer, correctness-reviewer, test-reviewer, maintainability-reviewer, company-policy-reviewer.",
                 "Return JSON only in this shape:",
                 json.dumps(schema, ensure_ascii=False),
                 "Code-review skill instructions:",
@@ -1330,7 +1752,13 @@ class AliyunDashScopeClient(LLMClient):
         assignments = payload.get("assignments", [])
         if not isinstance(assignments, list):
             return {}
-        allowed = {"security-reviewer", "correctness-reviewer", "test-reviewer", "maintainability-reviewer"}
+        allowed = {
+            "security-reviewer",
+            "correctness-reviewer",
+            "test-reviewer",
+            "maintainability-reviewer",
+            "company-policy-reviewer",
+        }
         plan: dict[str, str] = {}
         for item in assignments:
             if not isinstance(item, dict):
@@ -1611,6 +2039,7 @@ class AliyunDashScopeClient(LLMClient):
                     "fix": "fix",
                     "why_accepted": "evidence-backed reason",
                     "critic_notes": "critic or lead notes",
+                    "policy_references": ["company policy id or source"],
                 }
             ],
             "rejected_findings": [],
@@ -1837,6 +2266,13 @@ class AliyunDashScopeClient(LLMClient):
                 "You are a senior maintainability reviewer. Focus on long-term code health: complexity, "
                 "coupling, confusing control flow, unsafe shared state, observability, and operational clarity. "
                 "Avoid duplicating security or correctness findings unless maintainability is the main issue. "
+                + base
+            ),
+            "company-policy-reviewer": (
+                "You are a company policy alignment reviewer. Focus only on violations of the provided company "
+                "knowledge, security baselines, payment policies, testing standards, and incident cases. "
+                "Every finding must cite concrete code evidence and a company policy or incident reference. "
+                "Do not report generic issues unless the company policy context makes them actionable. "
                 + base
             ),
             "critic-reviewer": (
@@ -2389,6 +2825,12 @@ class AgenticReviewLoop:
             )
         elif tool == "risk_scan":
             result = self.tools.risk_scan()
+        elif tool == "retrieve_company_policy":
+            result = self.tools.retrieve_company_policy(
+                str(args.get("query", "")),
+                args.get("category"),
+                int(args.get("max_results", 3)),
+            )
         else:
             return {"type": "tool", "ok": False, "tool": tool, "error": "Tool is not allowed"}
         return {"type": "tool", "ok": True, "tool": tool, "result": self._compact_result(result)}
@@ -2412,6 +2854,7 @@ class AgenticReviewLoop:
             self.evidence.add(item.finding_id, "file_context", context, "evidence-store")
         except Exception as exc:
             self.evidence.add(item.finding_id, "file_context_error", str(exc), "evidence-store")
+        self._attach_company_policy(item.finding_id, finding)
         self.bus.send(
             proposed_by,
             "lead-reviewer",
@@ -2420,6 +2863,16 @@ class AgenticReviewLoop:
             item.finding_id,
         )
         return item
+
+    def _attach_company_policy(self, finding_id: str, finding: Finding) -> None:
+        query = " ".join([finding.title, finding.category, finding.evidence, finding.impact, finding.suggestion])
+        policies = self.tools.retrieve_company_policy(query, category=finding.category, max_results=3)
+        for policy in policies:
+            content = (
+                f"{policy['policy_id']} ({policy['doc_path']}#{policy['heading']}): "
+                f"{policy['excerpt']} [method={policy['retrieval_method']} score={policy['score']}]"
+            )
+            self.evidence.add(finding_id, "company_policy", content, "company-rag")
 
     def _coverage_review(self, pr_description: str) -> None:
         if not self.llm_client or not self.llm_client.enabled:
@@ -2638,7 +3091,13 @@ class AgenticReviewLoop:
         self.transcript.emit("agent.observation", step=0, **obs)
         test_result = self.tools.run_tests(self.test_command) if self.test_command else None
         reviewers = SpecialtyReviewers(self.tools, self.collector, self.transcript)
-        for reviewer in ("security-reviewer", "correctness-reviewer", "test-reviewer", "maintainability-reviewer"):
+        for reviewer in (
+            "security-reviewer",
+            "correctness-reviewer",
+            "test-reviewer",
+            "maintainability-reviewer",
+            "company-policy-reviewer",
+        ):
             reviewers.run(reviewer, diff, files, test_result)
         self.transcript.emit("agent.finalize", reason="LLM unavailable; used local guardrails fallback.")
         self.todos.update(
@@ -2677,6 +3136,7 @@ class ReviewCouncil:
             ReviewAgentMember("correctness-reviewer", "Correctness and edge-case reviewer", tools, transcript, llm_client),
             ReviewAgentMember("test-reviewer", "Test coverage reviewer", tools, transcript, llm_client),
             ReviewAgentMember("maintainability-reviewer", "Maintainability reviewer", tools, transcript, llm_client),
+            ReviewAgentMember("company-policy-reviewer", "Company policy alignment reviewer", tools, transcript, llm_client),
         ]
         self.critic = CriticReviewer(self.bus, self.evidence, self.lifecycle, llm_client, skill_context)
 
@@ -2721,6 +3181,7 @@ class ReviewCouncil:
                     self.evidence.add(item.finding_id, "file_context", context, "evidence-store")
                 except Exception as exc:
                     self.evidence.add(item.finding_id, "file_context_error", str(exc), "evidence-store")
+                self._attach_company_policy(item.finding_id, finding)
                 self.bus.send(
                     member.name,
                     "lead-reviewer",
@@ -2748,6 +3209,24 @@ class ReviewCouncil:
         ]
         self.transcript.emit("council.complete", candidates=len(records), accepted=len(self.lifecycle.accepted()))
         return {"findings": records, "messages": self.bus.all()}
+
+    def _attach_company_policy(self, finding_id: str, finding: Finding) -> None:
+        query = " ".join(
+            [
+                finding.title,
+                finding.category,
+                finding.evidence,
+                finding.impact,
+                finding.suggestion,
+            ]
+        )
+        policies = self.tools.retrieve_company_policy(query, category=finding.category, max_results=3)
+        for policy in policies:
+            content = (
+                f"{policy['policy_id']} ({policy['doc_path']}#{policy['heading']}): "
+                f"{policy['excerpt']} [method={policy['retrieval_method']} score={policy['score']}]"
+            )
+            self.evidence.add(finding_id, "company_policy", content, "company-rag")
 
     def _resolve_findings(self) -> None:
         for item in self.lifecycle.all():
@@ -2827,6 +3306,7 @@ class DebateCouncilLoop:
             ReviewAgentMember("correctness-reviewer", "Correctness and edge-case reviewer", tools, transcript, llm_client),
             ReviewAgentMember("test-reviewer", "Test coverage reviewer", tools, transcript, llm_client),
             ReviewAgentMember("maintainability-reviewer", "Maintainability reviewer", tools, transcript, llm_client),
+            ReviewAgentMember("company-policy-reviewer", "Company policy alignment reviewer", tools, transcript, llm_client),
         ]
         self.critic = CriticReviewer(self.bus, self.evidence, self.lifecycle, llm_client, skill_context)
         self.observations: list[dict[str, Any]] = []
@@ -2918,6 +3398,7 @@ class DebateCouncilLoop:
                     self.evidence.add(item.finding_id, "file_context", context, "evidence-store")
                 except Exception as exc:
                     self.evidence.add(item.finding_id, "file_context_error", str(exc), "evidence-store")
+                self._attach_company_policy(item.finding_id, finding)
                 self.bus.send(
                     member.name,
                     "lead-reviewer",
@@ -2925,6 +3406,24 @@ class DebateCouncilLoop:
                     f"{finding.severity} {finding.category}: {finding.title}",
                     item.finding_id,
                 )
+
+    def _attach_company_policy(self, finding_id: str, finding: Finding) -> None:
+        query = " ".join(
+            [
+                finding.title,
+                finding.category,
+                finding.evidence,
+                finding.impact,
+                finding.suggestion,
+            ]
+        )
+        policies = self.tools.retrieve_company_policy(query, category=finding.category, max_results=3)
+        for policy in policies:
+            content = (
+                f"{policy['policy_id']} ({policy['doc_path']}#{policy['heading']}): "
+                f"{policy['excerpt']} [method={policy['retrieval_method']} score={policy['score']}]"
+            )
+            self.evidence.add(finding_id, "company_policy", content, "company-rag")
 
     def _debate_state(
         self,
@@ -3324,16 +3823,16 @@ class ReportWriterAgent:
         verdict = str(payload.get("verdict") or fallback["verdict"]).strip()
         if verdict not in VERDICTS:
             verdict = fallback["verdict"]
+        accepted = self._normalize_standard_findings(payload.get("accepted_findings")) or fallback["accepted_findings"]
+        rejected = self._normalize_standard_findings(payload.get("rejected_findings")) or fallback["rejected_findings"]
+        downgraded = self._normalize_standard_findings(payload.get("downgraded_findings")) or fallback["downgraded_findings"]
         return {
             "report_style": "standardized",
             "verdict": verdict,
             "summary_points": self._list_of_strings(payload.get("summary_points")) or fallback["summary_points"],
-            "accepted_findings": self._normalize_standard_findings(payload.get("accepted_findings"))
-            or fallback["accepted_findings"],
-            "rejected_findings": self._normalize_standard_findings(payload.get("rejected_findings"))
-            or fallback["rejected_findings"],
-            "downgraded_findings": self._normalize_standard_findings(payload.get("downgraded_findings"))
-            or fallback["downgraded_findings"],
+            "accepted_findings": self._merge_policy_references(accepted, fallback["accepted_findings"]),
+            "rejected_findings": self._merge_policy_references(rejected, fallback["rejected_findings"]),
+            "downgraded_findings": self._merge_policy_references(downgraded, fallback["downgraded_findings"]),
             "duplicate_notes": self._list_of_strings(payload.get("duplicate_notes")) or fallback["duplicate_notes"],
             "critic_notes": self._list_of_strings(payload.get("critic_notes")) or fallback["critic_notes"],
         }
@@ -3401,9 +3900,25 @@ class ReportWriterAgent:
                     "fix": str(item.get("fix", "")).strip()[:1200],
                     "why_accepted": str(item.get("why_accepted", "")).strip()[:1200],
                     "critic_notes": str(item.get("critic_notes", "")).strip()[:1200],
+                    "policy_references": self._list_of_strings(item.get("policy_references"))[:5],
                 }
             )
         return [item for item in normalized if item["issue"] and item["file"] and item["evidence"]]
+
+    def _merge_policy_references(
+        self,
+        items: list[dict[str, Any]],
+        fallback_items: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        fallback_by_location = {
+            (item.get("file"), item.get("line")): item.get("policy_references", [])
+            for item in fallback_items
+        }
+        for item in items:
+            if item.get("policy_references"):
+                continue
+            item["policy_references"] = fallback_by_location.get((item.get("file"), item.get("line")), [])
+        return items
 
     def _standard_finding(self, record: dict[str, Any], default_reason: str) -> dict[str, Any]:
         critic_notes = [
@@ -3411,6 +3926,11 @@ class ReportWriterAgent:
             for evidence in record.get("evidence_chain", [])
             if evidence.get("source") in {"critic_review", "critic_challenge"}
         ]
+        policy_references = [
+            evidence.get("content", "")
+            for evidence in record.get("evidence_chain", [])
+            if evidence.get("source") == "company_policy"
+        ][:5]
         return {
             "issue": str(record.get("title", "")),
             "severity": str(record.get("severity", "P3")),
@@ -3421,6 +3941,7 @@ class ReportWriterAgent:
             "fix": str(record.get("suggestion", "")),
             "why_accepted": str(record.get("resolution_reason") or default_reason),
             "critic_notes": " ".join(critic_notes)[:1200],
+            "policy_references": policy_references,
         }
 
     def _list_of_strings(self, value: Any) -> list[str]:
@@ -3572,9 +4093,14 @@ class CouncilReportWriter:
                         f"- {labels['fix']}: {finding.get('fix')}",
                         f"- {labels['why']}: {finding.get('why_accepted')}",
                         f"- {labels['critic']}: {finding.get('critic_notes') or 'none'}",
-                        "",
                     ]
                 )
+                policy_references = finding.get("policy_references") or []
+                if policy_references:
+                    policy_label = "\u516c\u53f8\u89c4\u8303\u4f9d\u636e" if zh else "Company policy"
+                    lines.append(f"- {policy_label}:")
+                    lines.extend(f"  - {reference}" for reference in policy_references)
+                lines.append("")
         for key, label in (("duplicate_notes", labels["duplicates"]), ("critic_notes", labels["critic"])):
             notes = report.get(key) or []
             lines.extend([f"## {label}", ""])
@@ -3801,6 +4327,10 @@ class ReviewAgent:
         llm_model: str = "qwen-turbo-latest",
         llm_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1",
         debate_max_actions: int = 12,
+        company_knowledge_dir: Path | None = None,
+        embedding_model: str = "text-embedding-v4",
+        embedding_dimensions: int = 1024,
+        disable_company_rag: bool = False,
     ):
         self.repo = repo.resolve()
         self.base = base
@@ -3814,16 +4344,21 @@ class ReviewAgent:
         self.llm_model = llm_model
         self.llm_base_url = llm_base_url
         self.debate_max_actions = debate_max_actions
+        self.company_knowledge_dir = company_knowledge_dir or (self.repo / "knowledge" / "company")
+        self.embedding_model = embedding_model
+        self.embedding_dimensions = embedding_dimensions
+        self.disable_company_rag = disable_company_rag
         self.output_dir = self.repo / OUTPUT_DIR_NAME
         self.transcript = Transcript(self.output_dir / TRANSCRIPT_NAME)
         self.collector = FindingCollector()
         self.todos = TodoManager()
         self.skills = SkillLoader(REPO_ROOT / "skills")
         self.skill_context = ""
-        self.tools = ReviewTools(self.repo, self.base, self.target, self.transcript)
         self.loaded_env_keys = load_env_file(self.repo / ".env")
         if self.loaded_env_keys:
             self.transcript.emit("env.load", path=".env", keys=self.loaded_env_keys)
+        self.company_kb = self._build_company_kb()
+        self.tools = ReviewTools(self.repo, self.base, self.target, self.transcript, self.company_kb)
         self.llm_client = self._build_llm_client()
         self.reviewers = SpecialtyReviewers(self.tools, self.collector, self.transcript)
         self.council_result: dict[str, Any] = {"findings": [], "messages": []}
@@ -3836,6 +4371,7 @@ class ReviewAgent:
             "secret_scan": self.tools.secret_scan,
             "search_code": self.tools.search_code,
             "risk_scan": self.tools.risk_scan,
+            "retrieve_company_policy": self.tools.retrieve_company_policy,
             "emit_finding": self.collector.emit,
             "write_report": lambda path=None: ReportWriter(
                 self.output_dir,
@@ -3846,6 +4382,21 @@ class ReviewAgent:
                 self.standardized_report,
             ).write(),
         }
+
+    def _build_company_kb(self) -> CompanyKnowledgeBase | None:
+        if self.disable_company_rag:
+            self.transcript.emit("company_rag.disabled", reason="--disable-company-rag")
+            return None
+        return CompanyKnowledgeBase(
+            knowledge_dir=self.company_knowledge_dir,
+            index_path=self.output_dir / COMPANY_KNOWLEDGE_INDEX_NAME,
+            transcript=self.transcript,
+            api_key=os.getenv("DASHSCOPE_API_KEY"),
+            base_url=self.llm_base_url,
+            embedding_model=self.embedding_model,
+            embedding_dimensions=self.embedding_dimensions,
+            enabled=True,
+        )
 
     def _build_llm_client(self) -> LLMClient | None:
         if self.llm_provider == "none":
@@ -3875,6 +4426,14 @@ class ReviewAgent:
         if not path.is_absolute():
             path = safe_repo_path(self.repo, str(path))
         return path.read_text(encoding="utf-8", errors="replace")
+
+    def _augment_skill_context(self, skill: str, query: str) -> str:
+        if not self.company_kb:
+            return skill
+        block = self.company_kb.context_block(query, max_results=5)
+        if not block:
+            return skill
+        return f"{skill}\n\n{block}"
 
     def run(self) -> dict[str, Any]:
         self.transcript.emit(
@@ -3906,6 +4465,7 @@ class ReviewAgent:
             self.transcript.emit("pr.description", chars=len(pr_description))
 
         if self.mode == "agentic":
+            self.skill_context = self._augment_skill_context(skill, pr_description)
             loop = AgenticReviewLoop(
                 tools=self.tools,
                 transcript=self.transcript,
@@ -3923,6 +4483,10 @@ class ReviewAgent:
             files = self.tools.changed_files()
             diff = self.tools.git_diff()
             test_result = self.tools.run_tests(self.test_command) if self.test_command else None
+            self.skill_context = self._augment_skill_context(
+                skill,
+                "\n".join([pr_description, json.dumps(files, ensure_ascii=False), truncate(diff, 12000)]),
+            )
 
             self.todos.update(
                 [
@@ -3935,7 +4499,7 @@ class ReviewAgent:
             self.transcript.emit("todo.update", todos=self.todos.items)
 
             if self.mode == "simple":
-                for reviewer in ("security-reviewer", "correctness-reviewer", "test-reviewer"):
+                for reviewer in ("security-reviewer", "correctness-reviewer", "test-reviewer", "company-policy-reviewer"):
                     print(f"[agent] spawning {reviewer}")
                     print("[agent] " + self.reviewers.run(reviewer, diff, files, test_result))
             elif self.mode == "debate":
@@ -4064,6 +4628,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--llm-provider", choices=["aliyun", "none"], default="aliyun", help="LLM provider for specialist reviewers.")
     parser.add_argument("--llm-model", default="qwen-turbo-latest", help="Aliyun DashScope model name, e.g. qwen-turbo-latest.")
     parser.add_argument("--llm-base-url", default="https://dashscope.aliyuncs.com/compatible-mode/v1", help="OpenAI-compatible DashScope base URL.")
+    parser.add_argument("--company-knowledge-dir", default="knowledge/company", help="Directory of company policy Markdown files for RAG alignment.")
+    parser.add_argument("--embedding-model", default="text-embedding-v4", help="DashScope embedding model for company policy RAG.")
+    parser.add_argument("--embedding-dimensions", type=int, default=1024, help="Embedding dimensions for company policy RAG.")
+    parser.add_argument("--disable-company-rag", action="store_true", help="Disable company policy RAG alignment.")
     parser.add_argument("--debate-max-actions", type=int, default=12, help="Maximum dynamic actions for debate council mode.")
     parser.add_argument("--judge-report", help="Run AI judge on a standardized judge_input.json instead of running review.")
     parser.add_argument("--judge-model", default="qwen-plus", help="Aliyun DashScope model for AI judge.")
@@ -4124,6 +4692,10 @@ def main(argv: list[str] | None = None) -> int:
         llm_model=args.llm_model,
         llm_base_url=args.llm_base_url,
         debate_max_actions=args.debate_max_actions,
+        company_knowledge_dir=repo / args.company_knowledge_dir,
+        embedding_model=args.embedding_model,
+        embedding_dimensions=args.embedding_dimensions,
+        disable_company_rag=args.disable_company_rag,
     )
     result = agent.run()
     print(f"[agent] verdict: {result['verdict']}")

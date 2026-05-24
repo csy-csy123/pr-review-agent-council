@@ -44,29 +44,36 @@
 ```mermaid
 flowchart TD
     A["输入<br/>repo + base/target + PR 描述"] --> B["ReviewAgent"]
-    B --> C["ReviewTools<br/>读取 diff / changed files / file context"]
+    B --> C["ReviewTools<br/>diff / context / risk_scan / retrieve_company_policy"]
     B --> D["SkillLoader<br/>加载 code-review skill"]
+    B --> D2["CompanyKnowledgeBase<br/>公司规范 Markdown -> chunks -> index"]
     B --> E["LLM Client<br/>Aliyun DashScope / Qwen"]
 
     C --> F["ReviewCouncil<br/>固定 workflow"]
     D --> F
+    D2 --> F
     E --> F
 
-    F --> G["Lead Reviewer<br/>制定 review focus"]
+    D2 --> G2["company_knowledge<br/>上下文注入"]
+    G2 --> G["Lead Reviewer<br/>制定 review focus"]
+    F --> G
     G --> H["Security Reviewer<br/>安全风险"]
     G --> I["Correctness Reviewer<br/>正确性问题"]
     G --> J["Test Reviewer<br/>测试缺口"]
     G --> K["Maintainability Reviewer<br/>可维护性"]
+    G --> K2["Company Policy Reviewer<br/>公司规范违规"]
 
     H --> L["Candidate Findings"]
     I --> L
     J --> L
     K --> L
+    K2 --> L
 
-    L --> M["EvidenceStore<br/>保存证据链"]
+    L --> L2["Finding-level RAG<br/>补充公司规范依据"]
+    L2 --> M["EvidenceStore<br/>保存 diff 证据 + company_policy"]
     M --> N["Critic Reviewer<br/>一轮质疑"]
     N --> O["Lead Reviewer<br/>一轮裁决"]
-    O --> P["ReportWriter<br/>生成 report.md / findings.json"]
+    O --> P["ReportWriter<br/>report.md / findings.json / judge_input.json<br/>policy_references"]
 ```
 
 再看当前默认 `--mode debate`。它保留 reviewer 分工，但把 finding 的质疑、补证、反驳、合并和裁决做成动态 loop。
@@ -74,21 +81,28 @@ flowchart TD
 ```mermaid
 flowchart TD
     A["输入<br/>repo + base/target + PR 描述"] --> B["ReviewAgent"]
-    B --> C["ReviewTools<br/>只读工具"]
+    B --> C["ReviewTools<br/>只读工具 + risk_scan + retrieve_company_policy"]
     B --> D["SkillLoader<br/>加载 code-review skill"]
+    B --> D2["CompanyKnowledgeBase<br/>安全基线 / 支付规范 / 测试策略 / 历史事故"]
     B --> E["LLM Client<br/>Aliyun DashScope / Qwen"]
 
     C --> F["git_diff / changed_files / read_file_context / search_code / secret_scan"]
     D --> G["skill_context"]
+    D2 --> G2["company_knowledge context"]
+    D2 --> G3["embedding_hybrid<br/>or keyword_fallback"]
     E --> H["Reviewer / Critic / Lead / ReportWriter"]
 
     F --> I["DebateCouncilLoop"]
     G --> I
+    G2 --> I
     H --> I
 
     I --> J["Specialist Reviewers<br/>Security / Correctness / Test / Maintainability"]
+    G3 --> J2["company-policy-reviewer<br/>RAG as reviewer"]
     J --> K["Candidate Findings"]
-    K --> L["EvidenceStore"]
+    J2 --> K
+    K --> K2["Finding-level RAG<br/>company_policy evidence"]
+    K2 --> L["EvidenceStore"]
     K --> M["FindingLifecycle"]
 
     M --> N["Lead Debate Controller"]
@@ -111,7 +125,7 @@ flowchart TD
     V --> W["Template Renderer"]
     W --> X["report.md"]
     W --> Y["findings.json"]
-    W --> Z["judge_input.json"]
+    W --> Z["judge_input.json<br/>policy_references"]
 
     Z --> AA["AI Judge<br/>qwen-plus"]
     AA --> AB["judge.json / judge.md"]
@@ -697,3 +711,66 @@ A：我会优先做三件事：第一，让 duplicate merge 更稳定，减少�
 4. 打开 `.review-agent/transcript.jsonl` 搜索 `debate.action`。
 5. 再跑 `--mode council`，比较旧模式。
 6. 最后运行 AI Judge，理解为什么不用 finding 数量作为唯一指标。
+
+## 18. 新版本补充：公司知识 RAG 对齐
+
+新版可以把项目讲成“多 Agent Debate + 公司知识 RAG”的组合：Debate Council 负责审查流程和裁决机制，RAG 负责把审查结果对齐到企业私有规范、历史事故和业务红线。
+
+### 18.1 为什么要加 RAG
+
+只靠通用 code-review skill，系统知道“安全、正确性、测试、可维护性”这些通用原则；但真实企业里还会有内部编码规范、安全基线、支付风控要求、历史事故复盘等私有知识。RAG 的价值是把这些知识以证据形式检索出来，让 finding 不只是“模型觉得有问题”，而是“这个问题违反了哪条公司规范”。
+
+### 18.2 RAG 具体加在哪里
+
+可以回答三层：
+
+1. 上下文层：review 开始前，根据 PR diff 和描述检索相关公司规范，注入 `<company_knowledge>`。
+2. 证据层：candidate finding 生成后，再用 finding 的 title、evidence、impact、suggestion 检索规范，写入 `EvidenceStore`，source 为 `company_policy`。
+3. 发现层：新增 `company-policy-reviewer`，用 `risk_scan + retrieve_company_policy` 主动生成公司规范违规 finding，解决“不在已有 finding 里就无法挂 RAG”的问题。
+
+```mermaid
+flowchart TD
+    A["PR diff + description"] --> B["CompanyKnowledgeBase"]
+    B --> C["DashScope embedding<br/>text-embedding-v4"]
+    B --> D["keyword_fallback"]
+    C --> E["retrieve_company_policy"]
+    D --> E
+    E --> F["<company_knowledge><br/>review context"]
+    F --> G["Specialist Reviewers"]
+    G --> H["Candidate Findings"]
+    H --> I["company_policy evidence"]
+    E --> J["company-policy-reviewer"]
+    J --> H
+    I --> K["Critic + Lead Controller"]
+    K --> L["ReportWriterAgent<br/>policy_references"]
+```
+
+### 18.3 面试问答
+
+**Q：这个 RAG 有效性怎么证明？**
+
+A：我不会只说“加了 RAG 分数更高”，而是看几个指标：高风险 finding 中 `company_policy` 的引用率、引用是否准确、`company-policy-reviewer` 相比关闭 RAG 多发现了哪些公司规范违规、severity 是否更符合公司规范，以及 `--disable-company-rag` 消融前后的报告差异。
+
+**Q：如果不符合公司规范的问题不在 finding 里怎么办？**
+
+A：这就是为什么我新增了 `company-policy-reviewer`。早期版本只是在已有 finding 后面挂规范证据，确实可能漏掉模型没先发现的问题；新版让 policy reviewer 主动调用 `risk_scan` 和 `retrieve_company_policy` 生成 policy finding，把 RAG 从事后补证升级成主动审查能力。
+
+**Q：为什么不用 Skill 实现？**
+
+A：Skill 适合沉淀通用审查方法，比如如何检查安全、测试和可维护性；但公司规范、历史事故和业务红线变化更频繁，也更像私有知识库。RAG 可以按需检索，并保留 `policy_id`、`doc_path`、`heading`、`excerpt` 等可追溯证据。两者是互补关系：Skill 负责方法论，RAG 负责公司知识对齐。
+
+**Q：embedding 不可用怎么办？**
+
+A：系统会记录 transcript 事件，并自动退化到关键词检索，结果标记为 `keyword_fallback`，不会伪装成 embedding RAG。这样无 API key 的本地 demo 仍能跑通，有 key 时再用 DashScope `text-embedding-v4` 做语义检索。
+
+### 18.4 简历写法
+
+可以新增这条：
+
+- 设计公司知识 RAG 对齐模块，将企业安全基线、支付规范、测试策略和历史事故案例切分为知识 chunks，调用 DashScope `text-embedding-v4` 构建向量索引，并结合关键词兜底检索相关规范，为 PR finding 注入 `company_policy` 证据和 `policy_references`。
+
+也可以新增这条：
+
+- 新增 `company-policy-reviewer`，基于 `risk_scan + retrieve_company_policy` 主动发现公司规范违规，并接入 Debate Council 的 Critic、Lead Controller 和 ReportWriterAgent，实现从规范检索、证据链注入到标准化报告评估的闭环。
+
+完整简历包装见 [resume-company-rag-update.md](resume-company-rag-update.md)。

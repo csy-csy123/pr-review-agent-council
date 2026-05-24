@@ -248,6 +248,262 @@ def test_risk_scan_extracts_payment_style_signals() -> None:
     assert "no_tests_changed" in names
 
 
+def test_company_knowledge_chunks_markdown_by_heading() -> None:
+    tmp_path = workspace_tmp("company-rag-chunks")
+    kb_dir = tmp_path / "knowledge"
+    kb_dir.mkdir()
+    (kb_dir / "payment_review_policy.md").write_text(
+        "# Payment Review Policy\n\n"
+        "Intro text.\n\n"
+        "## Webhook Signature Verification\n\n"
+        "Signature mismatch must fail closed and reject the event.\n",
+        encoding="utf-8",
+    )
+    transcript = review_agent.Transcript(tmp_path / "transcript.jsonl")
+    kb = review_agent.CompanyKnowledgeBase(kb_dir, tmp_path / "index.json", transcript, api_key="")
+
+    chunks = kb._load_chunks()
+
+    assert any(chunk.heading == "Webhook Signature Verification" for chunk in chunks)
+    assert any(chunk.doc_path == "payment_review_policy.md" for chunk in chunks)
+
+
+def test_company_knowledge_keyword_fallback_retrieves_webhook_policy() -> None:
+    tmp_path = workspace_tmp("company-rag-keyword")
+    kb_dir = tmp_path / "knowledge"
+    kb_dir.mkdir()
+    (kb_dir / "payment_review_policy.md").write_text(
+        "# Payment Review Policy\n\n"
+        "## Webhook Signature Verification\n\n"
+        "Payment webhook signature mismatch must fail closed and reject the accepted event.\n",
+        encoding="utf-8",
+    )
+    transcript = review_agent.Transcript(tmp_path / "transcript.jsonl")
+    kb = review_agent.CompanyKnowledgeBase(kb_dir, tmp_path / "index.json", transcript, api_key="")
+
+    results = kb.search("webhook signature mismatch accepted", max_results=1)
+
+    assert results[0]["policy_id"].startswith("payment_review_policy:")
+    assert results[0]["retrieval_method"] == "keyword_fallback"
+    events = [json.loads(line)["event"] for line in (tmp_path / "transcript.jsonl").read_text().splitlines()]
+    assert "company_rag.embedding_disabled" in events
+
+
+def test_company_knowledge_embedding_request_uses_openai_compatible_shape(monkeypatch) -> None:
+    tmp_path = workspace_tmp("company-rag-embedding-request")
+    transcript = review_agent.Transcript(tmp_path / "transcript.jsonl")
+    kb = review_agent.CompanyKnowledgeBase(
+        tmp_path,
+        tmp_path / "index.json",
+        transcript,
+        api_key="test-key",
+        base_url="https://example.test/compatible-mode/v1",
+        embedding_model="text-embedding-v4",
+        embedding_dimensions=1024,
+    )
+    captured = {}
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self):
+            return json.dumps({"data": [{"index": 0, "embedding": [1.0, 0.0]}]}).encode("utf-8")
+
+    def fake_urlopen(request, timeout):
+        captured["url"] = request.full_url
+        captured["payload"] = json.loads(request.data.decode("utf-8"))
+        captured["authorization"] = request.headers["Authorization"]
+        captured["timeout"] = timeout
+        return FakeResponse()
+
+    monkeypatch.setattr(review_agent.urllib.request, "urlopen", fake_urlopen)
+
+    vectors = kb._embed_texts(["webhook signature"])
+
+    assert vectors == [[1.0, 0.0]]
+    assert captured["url"].endswith("/embeddings")
+    assert captured["payload"] == {
+        "model": "text-embedding-v4",
+        "input": ["webhook signature"],
+        "dimensions": 1024,
+    }
+    assert captured["authorization"] == "Bearer test-key"
+
+
+def test_company_knowledge_embedding_hybrid_ranks_by_cosine() -> None:
+    tmp_path = workspace_tmp("company-rag-cosine")
+    kb_dir = tmp_path / "knowledge"
+    kb_dir.mkdir()
+    (kb_dir / "security_baseline.md").write_text(
+        "# Security Baseline\n\n"
+        "## Token Logging\n\n"
+        "Tokens and card numbers must not be logged.\n\n"
+        "## SQL Parameterization\n\n"
+        "SQL queries must use parameterized query binding.\n",
+        encoding="utf-8",
+    )
+    transcript = review_agent.Transcript(tmp_path / "transcript.jsonl")
+    kb = review_agent.CompanyKnowledgeBase(kb_dir, tmp_path / "index.json", transcript, api_key="test-key")
+
+    def fake_embed(texts):
+        if len(texts) == 1:
+            return [[1.0, 0.0]]
+        return [[1.0, 0.0], [0.0, 1.0]]
+
+    kb._embed_texts = fake_embed  # type: ignore[method-assign]
+
+    results = kb.search("card token log", max_results=2)
+
+    assert results[0]["heading"] == "Token Logging"
+    assert results[0]["retrieval_method"] == "embedding_hybrid"
+    assert (tmp_path / "index.json").exists()
+
+
+def test_company_knowledge_index_rebuilds_when_dimensions_change() -> None:
+    tmp_path = workspace_tmp("company-rag-cache")
+    kb_dir = tmp_path / "knowledge"
+    kb_dir.mkdir()
+    (kb_dir / "security_baseline.md").write_text(
+        "# Security Baseline\n\n## Token Logging\n\nDo not log token values.\n",
+        encoding="utf-8",
+    )
+    transcript = review_agent.Transcript(tmp_path / "transcript.jsonl")
+    index_path = tmp_path / "index.json"
+    kb = review_agent.CompanyKnowledgeBase(kb_dir, index_path, transcript, api_key="test-key", embedding_dimensions=2)
+    kb._embed_texts = lambda texts: [[1.0, 0.0] for _ in texts]  # type: ignore[method-assign]
+
+    kb.search("token log")
+    first = json.loads(index_path.read_text(encoding="utf-8"))
+    kb2 = review_agent.CompanyKnowledgeBase(kb_dir, index_path, transcript, api_key="test-key", embedding_dimensions=3)
+    kb2._embed_texts = lambda texts: [[1.0, 0.0, 0.0] for _ in texts]  # type: ignore[method-assign]
+    kb2.search("token log")
+    second = json.loads(index_path.read_text(encoding="utf-8"))
+
+    assert first["dimensions"] == 2
+    assert second["dimensions"] == 3
+
+
+def test_retrieve_company_policy_tool_returns_stable_shape() -> None:
+    tmp_path = workspace_tmp("company-rag-tool")
+    kb_dir = tmp_path / "knowledge"
+    kb_dir.mkdir()
+    (kb_dir / "security_baseline.md").write_text(
+        "# Security Baseline\n\n## Sensitive Logging\n\nDo not log card token secrets.\n",
+        encoding="utf-8",
+    )
+    transcript = review_agent.Transcript(tmp_path / "transcript.jsonl")
+    kb = review_agent.CompanyKnowledgeBase(kb_dir, tmp_path / "index.json", transcript, api_key="")
+    tools = review_agent.ReviewTools(tmp_path, "main", "HEAD", transcript, kb)
+
+    results = tools.retrieve_company_policy("log card token", max_results=1)
+
+    assert set(results[0]) == {"policy_id", "doc_path", "heading", "excerpt", "score", "retrieval_method"}
+    assert results[0]["heading"] == "Sensitive Logging"
+
+
+def test_company_policy_reviewer_promotes_policy_violation_from_risk_scan() -> None:
+    tmp_path = workspace_tmp("company-policy-reviewer")
+    kb_dir = tmp_path / "knowledge"
+    kb_dir.mkdir()
+    (kb_dir / "payment_review_policy.md").write_text(
+        "# Payment Review Policy\n\n"
+        "## Webhook Signature Verification\n\n"
+        "Payment webhook signature mismatch must fail closed and reject the event.\n",
+        encoding="utf-8",
+    )
+    transcript = review_agent.Transcript(tmp_path / "transcript.jsonl")
+    kb = review_agent.CompanyKnowledgeBase(kb_dir, tmp_path / "index.json", transcript, api_key="")
+    tools = review_agent.ReviewTools(tmp_path, "main", "HEAD", transcript, kb)
+    tools.git_diff = lambda base=None, target=None: """diff --git a/payment.py b/payment.py
+--- a/payment.py
++++ b/payment.py
+@@ -1,0 +1,5 @@
++def handle(headers):
++    signature = headers.get("X-Signature")
++    if signature != WEBHOOK_SECRET:
++        print("signature mismatch")
++    return {"status": "accepted"}
+"""  # type: ignore[method-assign]
+    tools.changed_files = lambda base=None, target=None: [{"file": "payment.py", "added": 5, "deleted": 0}]  # type: ignore[method-assign]
+    collector = review_agent.FindingCollector()
+    reviewers = review_agent.SpecialtyReviewers(tools, collector, transcript)
+
+    count = reviewers.run("company-policy-reviewer", "", [], None)
+
+    assert "1 finding" in count
+    assert collector.findings[0].title == "Company policy requires webhook signature failures to reject"
+    assert "payment_review_policy:webhook-signature-verification" in collector.findings[0].evidence
+
+
+def test_council_attaches_company_policy_evidence() -> None:
+    tmp_path = workspace_tmp("company-rag-council")
+    (tmp_path / "service.py").write_text("def approve():\n    return {'decision': 'approved'}\n", encoding="utf-8")
+    kb_dir = tmp_path / "knowledge"
+    kb_dir.mkdir()
+    (kb_dir / "security_baseline.md").write_text(
+        "# Security Baseline\n\n"
+        "## Auth Approval\n\n"
+        "Authorization bypass and approval branches must be backed by signature validation.\n",
+        encoding="utf-8",
+    )
+    transcript = review_agent.Transcript(tmp_path / "transcript.jsonl")
+    kb = review_agent.CompanyKnowledgeBase(kb_dir, tmp_path / "index.json", transcript, api_key="")
+    tools = review_agent.ReviewTools(tmp_path, "main", "HEAD", transcript, kb)
+    collector = review_agent.FindingCollector()
+    council = review_agent.ReviewCouncil(
+        tools,
+        transcript,
+        collector,
+        critic_pass=True,
+        llm_client=FakeCouncilLLMClient(),
+        skill_context="<skill name=\"code-review\">review rules</skill>",
+    )
+
+    result = council.run("", [{"file": "service.py", "added": 2, "deleted": 0}], None, "Auth change")
+
+    record = next(item for item in result["findings"] if item["title"] == "LLM detected auth bypass")
+    assert any(evidence["source"] == "company_policy" for evidence in record["evidence_chain"])
+
+
+def test_report_writer_fallback_includes_policy_references() -> None:
+    tmp_path = workspace_tmp("company-rag-report")
+    transcript = review_agent.Transcript(tmp_path / "transcript.jsonl")
+    context = {
+        "council_records": [
+            {
+                "file": "service.py",
+                "line": 2,
+                "severity": "P1",
+                "category": "security",
+                "title": "Sensitive token exposure",
+                "evidence": "print(token)",
+                "impact": "Token can leak.",
+                "suggestion": "Mask token.",
+                "finding_id": "F-001",
+                "status": "accepted",
+                "resolution_reason": "Company policy supports blocking this.",
+                "evidence_chain": [
+                    {
+                        "source": "company_policy",
+                        "content": "SEC-LOG-001: Logs must never include tokens.",
+                    }
+                ],
+            }
+        ],
+        "council_messages": [],
+    }
+
+    draft = review_agent.ReportWriterAgent(None, transcript, language="en").draft(context)
+
+    assert draft["accepted_findings"][0]["policy_references"] == [
+        "SEC-LOG-001: Logs must never include tokens."
+    ]
+
+
 
 def test_aliyun_client_without_api_key_skips_network() -> None:
     tmp_path = workspace_tmp("aliyun-no-key")
